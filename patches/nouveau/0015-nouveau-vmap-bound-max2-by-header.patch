@@ -1,0 +1,15 @@
+Subject: [PATCH] Bound VBIOS voltage max2 ID by table header size
+
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/bios/vmap.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/bios/vmap.c
+@@ -68,7 +68,9 @@
+ 	case 0x20:
+ 		info->max0 = nvbios_rd08(bios, vmap + 0x7);
+ 		info->max1 = nvbios_rd08(bios, vmap + 0x8);
+-		if (*len >= 0xc)
++		/* max2 lives in the table header at +0x0c, not in an entry.
++		 * A short header followed by a long entry must not fabricate an ID. */
++		if (*hdr >= 0x0d)
+ 			info->max2 = nvbios_rd08(bios, vmap + 0xc);
+ 		else
+ 			info->max2 = 0xff;
