@@ -1,0 +1,55 @@
+From: Codex <codex@openai.com>
+Subject: [PATCH] nouveau: only read selected GF117 PWM channel
+
+The read-only GF117 PWM diagnostic currently reads all PWM channel candidates
+for every p-state, even when GPIO11 selects only one channel. Decode the mux
+first, then read only the corresponding GF119 channel or PTHERM pair. Invalid
+mux values cause no candidate-register reads. This remains read-only.
+
+--- a/drivers/gpu/drm/nouveau/nouveau_debugfs.c
++++ b/drivers/gpu/drm/nouveau/nouveau_debugfs.c
+@@ -237,12 +237,7 @@
+ 			 * channel candidates read-only; the GK104 voltage pair is unrelated. */
+ 			{
+ 				u32 gpio11 = nvif_rd32(&ndrm->client.device.object, 0x00d63c);
+-				u32 div0 = nvif_rd32(&ndrm->client.device.object, 0x00e114);
+-				u32 duty0 = nvif_rd32(&ndrm->client.device.object, 0x00e118);
+-				u32 div1 = nvif_rd32(&ndrm->client.device.object, 0x00e11c);
+-				u32 duty1 = nvif_rd32(&ndrm->client.device.object, 0x00e120);
+-				u32 thdiv = nvif_rd32(&ndrm->client.device.object, 0x0200d8);
+-				u32 thduty = nvif_rd32(&ndrm->client.device.object, 0x0200dc);
++				u32 div = 0, duty = 0;
+ 				int pwm_index = -1;
+ 
+ 				if ((gpio11 & 0x000000c0) == 0x00000000 ||
+@@ -252,11 +247,26 @@
+ 					case 0x19: pwm_index = 1; break;
+ 					case 0x1c: pwm_index = 0; break;
+ 					default: break;
+-					}
+ 				}
+-				seq_printf(m, "gf117_pwm_diag gpio_line11=%08x pwm_index=%d "
+-					   "pwm0=%08x/%08x pwm1=%08x/%08x therm=%08x/%08x\n",
+-					   gpio11, pwm_index, div0, duty0, div1, duty1, thdiv, thduty);
++				}
++				switch (pwm_index) {
++				case 0:
++					div = nvif_rd32(&ndrm->client.device.object, 0x00e114);
++					duty = nvif_rd32(&ndrm->client.device.object, 0x00e118);
++					break;
++				case 1:
++					div = nvif_rd32(&ndrm->client.device.object, 0x00e11c);
++					duty = nvif_rd32(&ndrm->client.device.object, 0x00e120);
++					break;
++				case 2:
++					div = nvif_rd32(&ndrm->client.device.object, 0x0200d8);
++					duty = nvif_rd32(&ndrm->client.device.object, 0x0200dc);
++					break;
++				default:
++					break;
++				}
++				seq_printf(m, "gf117_pwm_diag gpio_line11=%08x pwm_index=%d selected=%08x/%08x\n",
++					   gpio11, pwm_index, div, duty);
+ 			}
+ 		}
+ 

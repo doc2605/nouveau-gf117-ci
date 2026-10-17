@@ -234,3 +234,20 @@ reclock. O mapeamento do PWM térmico é uma pista candidata para a saída
 
 O teste `tools/test-gf117-pwm-probe.py` verifica os endereços e a ausência de
 qualquer accessor de escrita no bloco diagnóstico.
+
+## 0019 `gf117-read-selected-pwm-channel`
+
+O diagnóstico 0018 lia os três pares de registradores candidatos em toda
+leitura do plano, embora o mux da GPIO 11 selecione no máximo um canal. O patch
+0019 decodifica primeiro o mux e lê somente o par correspondente (PWM 0, PWM 1
+ou PTHERM); mux desconhecido não provoca leituras de candidatos. A saída passa
+a expor `pwm_index` e `selected=divisor/duty`. Continua sendo leitura bruta, sem
+interpretação como tensão e sem qualquer escrita.
+
+`tools/test-gf117-pwm-probe.py` valida a associação de cada índice aos seus dois
+endereços, impede leituras dos outros canais em cada ramo e rejeita acessores
+de escrita. O patch aplicou sem fuzz sobre a série 0001–0018; os harnesses
+GF117 de clock, RAM, VGA, CRTC, worker e PLL passaram. O módulo compilou localmente
+contra os headers instalados `7.2.9-2-cachyos`, com vermagic correspondente.
+Isso valida a compilação e o caminho diagnóstico estático, não a leitura real
+da GPIO/PWM nesta placa.
