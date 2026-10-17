@@ -7,6 +7,7 @@ import tempfile
 root = Path(sys.argv[1])
 debugfs = (root / "drivers/gpu/drm/nouveau/nouveau_debugfs.c").read_text()
 base = (root / "drivers/gpu/drm/nouveau/nvkm/engine/device/base.c").read_text()
+therm = (root / "drivers/gpu/drm/nouveau/nvkm/subdev/therm/gf119.c").read_text()
 marker = "/* GF117 uses gf119_therm_new(). Expose the documented GF119 PWM"
 assert marker in debugfs
 probe = debugfs.split(marker, 1)[1].split("\n\t\t\t}", 1)[0]
@@ -40,12 +41,18 @@ nvd7 = base.split("nvd7_chipset =", 1)[1].split("};", 1)[0]
 assert '.therm    = { 0x00000001, gf119_therm_new }' in nvd7
 assert 'gf117_pwm_diag' in probe
 
+# Compile the real GF119 mux decoder too, so the debugfs probe is compared
+# against the production PWM routing rather than a second copied table.
+pwm_info = therm[therm.index("\npwm_info(") + 1:]
+pwm_info = "static int\n" + pwm_info.split("\n}\n", 1)[0] + "\n}"
+
 # Compile and execute the actual diagnostic block with mocked MMIO reads.
 # This verifies mux-to-channel routing and that invalid muxes touch no candidate
 # register; it does not emulate hardware behavior or voltage measurement.
 block = probe[probe.index("\n\t\t\t{"):]
 block += "\n\t\t\t}"
 harness = r'''#include <stdarg.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -55,9 +62,21 @@ struct nouveau_drm {
 	struct { struct { struct nvif_object object; } device; } client;
 };
 struct seq_file { char text[256]; };
+struct nvkm_device { int unused; };
+struct nvkm_subdev { struct nvkm_device *device; };
+struct nvkm_therm { struct nvkm_subdev subdev; };
 static u32 gpio_value;
 static u32 addresses[4];
 static unsigned read_count;
+static unsigned nvkm_gpio_reads;
+static u32 nvkm_rd32(struct nvkm_device *device, u32 address)
+{
+	(void)device;
+	if (address != 0x00d63c) return 0xffffffff;
+	nvkm_gpio_reads++;
+	return gpio_value;
+}
+#define nvkm_error(...) do { } while (0)
 static u32 nvif_rd32(struct nvif_object *object, u32 address)
 {
 	(void)object;
@@ -81,6 +100,7 @@ static int seq_printf(struct seq_file *m, const char *format, ...)
 	va_end(args);
 	return ret;
 }
+/* PWM_INFO_FUNCTION */
 static void run_probe(struct nouveau_drm *ndrm, struct seq_file *m)
 {
 /* PROBE_BLOCK */
@@ -90,7 +110,16 @@ static int check(u32 gpio, int index, u32 first, u32 second,
 {
 	struct nouveau_drm drm = {0};
 	struct seq_file output = {0};
+	struct nvkm_device device = {0};
+	struct nvkm_therm pwm_therm = { .subdev = { .device = &device } };
 	gpio_value = gpio;
+	nvkm_gpio_reads = 0;
+	int actual_index = pwm_info(&pwm_therm, 11);
+	if (index < 0) {
+		if (actual_index != -ENODEV || nvkm_gpio_reads != 1) return 6;
+	} else if (actual_index != index || nvkm_gpio_reads != 1) {
+		return 7;
+	}
 	read_count = 0;
 	memset(addresses, 0, sizeof(addresses));
 	run_probe(&drm, &output);
@@ -118,7 +147,8 @@ int main(void)
 	if (check(0x01, -1, 0, 0, 0, 0)) return 15;
 	return 0;
 }
-'''.replace("/* PROBE_BLOCK */", block)
+'''.replace("/* PROBE_BLOCK */", block).replace(
+    "/* PWM_INFO_FUNCTION */", pwm_info)
 with tempfile.TemporaryDirectory(prefix="gf117-pwm-probe-") as directory:
     source = Path(directory) / "probe.c"
     binary = Path(directory) / "probe"
