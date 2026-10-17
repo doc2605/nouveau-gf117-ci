@@ -1,0 +1,91 @@
+Subject: [PATCH] nouveau: trace GF117 PWM and blocked CRTC accesses
+
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/volt/gf117.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/volt/gf117.c
+@@ -39,15 +39,25 @@
+ 	struct gf117_volt *volt = container_of(base, struct gf117_volt, base);
+ 	struct nvkm_device *device = base->subdev.device;
+ 	u32 div = nvkm_rd32(device, 0x20340);
+-	u32 duty = nvkm_rd32(device, 0x20344) & 0x7fffffff;
++	u32 raw = nvkm_rd32(device, 0x20344);
++	u32 duty = raw & 0x7fffffff;
+ 	u64 uv;
+ 
+ 	/* This mode is read-only until GF117 PWM programming is validated. */
+-	if (!div || duty > div)
++	if (!div || duty > div) {
++		nvkm_error_ratelimited(&base->subdev,
++				       "GF117 PWM readback invalid: div=%08x raw=%08x duty=%u\n",
++				       div, raw, duty);
+ 		return -ERANGE;
++	}
+ 	uv = volt->bios.base + div64_u64((u64)volt->bios.pwm_range * duty, div);
+-	if (uv < base->min_uv || uv > base->max_uv || uv > INT_MAX)
++	if (uv < base->min_uv || uv > base->max_uv || uv > INT_MAX) {
++		nvkm_error_ratelimited(&base->subdev,
++				       "GF117 PWM readback out of range: uv=%llu base=%u range=%u min=%u max=%u\n",
++				       uv, volt->bios.base, volt->bios.pwm_range,
++				       base->min_uv, base->max_uv);
+ 		return -ERANGE;
++	}
+ 	return (int)uv;
+ }
+ 
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/vga.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/vga.c
+@@ -51,8 +51,11 @@
+ void
+ nvkm_wrport(struct nvkm_device *device, int head, u16 port, u8 data)
+ {
+-	if (device->chipset == 0xd7 && (port == 0x03d4 || port == 0x03d5))
++	if (device->chipset == 0xd7 && (port == 0x03d4 || port == 0x03d5)) {
++		pr_warn_once("nouveau GF117: blocked NVKM VGA CRTC port write: port=%04x data=%02x\n",
++			     port, data);
+ 		return;
++	}
+ 
+ 	if (device->card_type >= NV_50)
+ 		nvkm_wr08(device, 0x601000 + port, data);
+--- a/drivers/gpu/drm/nouveau/dispnv04/hw.h
++++ b/drivers/gpu/drm/nouveau/dispnv04/hw.h
+@@ -121,8 +121,11 @@
+ {
+ 	struct nvif_object *device = &nouveau_drm(dev)->client.device.object;
+ 	/* GF117 has no legacy display CRTC. NVIF MMIO bypasses NVKM VGA helpers. */
+-	if (nouveau_drm(dev)->client.device.info.chipset == 0xd7)
++	if (nouveau_drm(dev)->client.device.info.chipset == 0xd7) {
++		pr_warn_once("nouveau GF117: blocked DRM NVWriteVgaCrtc head=%d index=%02x value=%02x\n",
++			     head, index, value);
+ 		return;
++	}
+ 
+ 	nvif_wr08(device, NV_PRMCIO_CRX__COLOR + head * NV_PRMCIO_SIZE, index);
+ 	nvif_wr08(device, NV_PRMCIO_CR__COLOR + head * NV_PRMCIO_SIZE, value);
+@@ -134,8 +137,11 @@
+ 	struct nvif_object *device = &nouveau_drm(dev)->client.device.object;
+ 	uint8_t val;
+ 	/* GF117 has no legacy display CRTC. NVIF MMIO bypasses NVKM VGA helpers. */
+-	if (nouveau_drm(dev)->client.device.info.chipset == 0xd7)
++	if (nouveau_drm(dev)->client.device.info.chipset == 0xd7) {
++		pr_warn_once("nouveau GF117: blocked DRM NVReadVgaCrtc head=%d index=%02x\n",
++			     head, index);
+ 		return 0;
++	}
+ 
+ 	nvif_wr08(device, NV_PRMCIO_CRX__COLOR + head * NV_PRMCIO_SIZE, index);
+ 	val = nvif_rd08(device, NV_PRMCIO_CR__COLOR + head * NV_PRMCIO_SIZE);
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/devinit/gf100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/devinit/gf100.c
+@@ -107,8 +107,11 @@
+ gf100_devinit_mmio(struct nvkm_devinit *init, u32 addr)
+ {
+ 	if (init->subdev.device->chipset == 0xd7 &&
+-	    (addr & ~3U) == 0x6013d4)
++	    (addr & ~3U) == 0x6013d4) {
++		nvkm_warn(&init->subdev,
++			  "GF117 blocked VBIOS CRTC MMIO access: addr=%06x\n", addr);
+ 		return ~0U; /* interpreter sentinel: skip access, not register zero */
++	}
+ 	return addr;
+ }
+ 

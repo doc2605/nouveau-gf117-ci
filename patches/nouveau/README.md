@@ -138,3 +138,74 @@ Nenhum setter é chamado pelo diagnóstico. O helper exige leitura/alvo positivo
 e um plano válido do estado nominal antes de solicitar p-state. Leitura de VID
 não é medição física da alimentação da GPU e não garante que uma escrita futura
 terá sucesso. O caminho real mantém as validações após a programação.
+
+## 0011 `gf117-completion-and-failure-latch`
+
+No modo experimental GF117, espera a conclusão do worker antes de retornar o
+resultado ao usuário. O flag `waiting` era consumido na entrada do worker e
+permitia retornar enquanto a programação continuava. Uma falha fica registrada
+até reconstruir o dispositivo e bloqueia novas tentativas automáticas.
+
+Também rejeita índices de p-state fora da lista e intervalos PLL sem nenhum M
+válido, limites de entrada invertidos e frequências que excedam o retorno `int`.
+Os testes `test-gf117-worker-source.py` e `test-gf117-pll-source.py` compilam as
+funções reais; o primeiro força uma pausa do worker após consumir o flag.
+
+## 0012 `gf117-validate-voltage-ceilings`
+
+O caminho experimental usa o estado base da VBIOS. Aplica os limites `max_uv` e
+`max0_id/max1_id/max2_id` antes de programar tensão, incluindo o arredondamento
+para um VID existente. Valida a leitura após a programação contra o alvo e o
+limite. Falha na leitura ou no mapeamento impede continuar.
+
+O debugfs usa o mesmo preflight somente leitura e informa limite, máscara e
+quantidade de VIDs. O teste de core verifica alvos acima do teto, arredondamento
+inviável e limites inválidos, sem chamadas de escrita nesses casos.
+
+## 0013 `pll-respect-input-frequency-bounds`
+
+Corrige o intervalo do divisor M: o mínimo usa `ceil(refclk/max_inputfreq)`
+e o máximo usa `floor(refclk/min_inputfreq)`. As expressões anteriores somavam
+o denominador nas duas divisões, podendo excluir um limite exato válido e
+admitir M que deixa a frequência de entrada abaixo do mínimo da VBIOS.
+
+O teste da função real reproduziu a violação antes da correção. Verifica os
+limites inclusivos, referência não divisível e o produto `min_input*M <= refclk
+<= max_input*M`, além dos casos já cobertos pelo patch 0011.
+
+## 0014 `gf117-pwm-readback-and-crtc-guard`
+
+A VBIOS ativa desta GF117, lida somente pelo debugfs, declara tensão PWM
+650000–1150000 µV, frequência 172800 Hz e um GPIO `VID_PWM` na linha 11.
+Os estados 07 e 0f usam o mesmo mapa de 850000 µV. O backend anterior era
+somente GPIO VID e deixava `vid_count=0`, explicando `voltage_uv=-22`.
+
+O patch seleciona um getter PWM somente leitura quando VBIOS e GPIO concordam.
+Ele valida divisor/duty e limites de tensão. Não implementa setter PWM: se a
+tensão lida for inferior ao alvo, o preflight continua bloqueando o reclock.
+O endereço de leitura `0x20340/0x20344` vem do caminho PWM existente GK104;
+se a GF117 tiver layout diferente, a leitura falhará de modo conservador.
+
+Também bloqueia escritas por acessores NVKM no CRTC `0x6013d4–0x6013d7`
+inexistente na GF117 e registra o chamador. A origem do fault anterior só
+será confirmada por um novo log físico. O helper ainda aborta se houver fault.
+Compilação e plano de p-state não provam 750 MHz.
+
+## 0015 `vmap-bound-max2-by-header`
+
+O parser VBIOS 0x20 consultava o ID `max2` em `table+0x0c` quando o tamanho
+da **entrada** era pelo menos 12, embora esse campo pertença ao cabeçalho.
+Nesta ROM o cabeçalho tem 10 bytes e a entrada tem 38: o byte lido era o
+primeiro `min_uv`, interpretado como ID 80. O mapa de ID 80 não existe;
+o fallback produziria um teto falso de 800000 µV e bloquearia o alvo
+legítimo de 850000 µV. A checagem agora exige cabeçalho de pelo menos 13
+bytes antes de consultar `max2`. Sem esse campo, o ID é `0xff`.
+
+## 0016 `gf117-trace-pwm-and-blocked-crtc-accesses`
+
+A leitura PWM anterior falhou com `-ERANGE` sem mostrar os registradores brutos.
+Este patch registra divisor, duty e faixa calculada quando a leitura é rejeitada,
+sem habilitar escrita PWM. Também registra qual dos guards VGA/DRM/VBIOS de GF117
+foi acionado para o CRTC legado. As mensagens são instrumentação; não provam que
+o fault em `6013d4` foi eliminado. O próximo módulo deve ser compilado e revisado
+antes de qualquer nova carga física.

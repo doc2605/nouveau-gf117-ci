@@ -16,6 +16,8 @@ prelude=r'''
 #include <stdio.h>
 typedef uint8_t u8;typedef uint16_t u16;typedef uint32_t u32;
 #define NV_50 0x50
+#define pr_warn_once(...) do { } while (0)
+#define nvkm_warn(...) do { } while (0)
 #define NV_40 0x40
 struct nvkm_device;
 struct nvkm_subdev { struct nvkm_device *device; };
