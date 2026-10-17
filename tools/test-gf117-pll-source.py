@@ -26,8 +26,13 @@ int main(void){
  .vco1={.max_freq=1200000,.min_inputfreq=10000,.max_inputfreq=27000,.min_m=1,.max_m=8,.min_n=16,.max_n=255}};
  int ret=gt215_pll_calc(&sd,&i,775000,&n,NULL,&m,&p);assert(ret>750000 && ret<800000);
  assert(m>=1 && m<=8 && n>=16 && n<=255 && p>=1 && p<=8);
+ assert((u64)i.vco1.min_inputfreq*m<=i.refclk && (u64)i.vco1.max_inputfreq*m>=i.refclk);
  assert(gt215_pll_calc(&sd,&i,775000,&n,&f,&m,&p)==775000);
  assert(f>=0 && f<=65535);
+ i.vco1.min_inputfreq=i.vco1.max_inputfreq=27000;
+ assert(gt215_pll_calc(&sd,&i,810000,&n,NULL,&m,&p)==810000 && m==1);
+ i.vco1.min_inputfreq=10000;i.vco1.max_inputfreq=20000;
+ assert(gt215_pll_calc(&sd,&i,775000,&n,NULL,&m,&p)>0 && m==2);
  assert(gt215_pll_calc(&sd,&i,UINT32_MAX,&n,&f,&m,&p)==-ERANGE);
  i.vco1.min_m=3;i.vco1.min_inputfreq=100000;i.vco1.max_inputfreq=100000;
  assert(gt215_pll_calc(&sd,&i,775000,&n,NULL,&m,&p)==-ERANGE);

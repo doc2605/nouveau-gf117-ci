@@ -1,0 +1,21 @@
+Subject: [PATCH] Respect inclusive VBIOS PLL input-frequency bounds
+
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/clk/pllgt215.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/clk/pllgt215.c
+@@ -55,13 +55,13 @@
+ 	if (!*P)
+ 		return -ERANGE;
+ 
+-	quotient = ((u64)info->refclk + info->vco1.max_inputfreq) /
++	/* Keep refclk / M within the inclusive VBIOS input-frequency limits. */
++	quotient = ((u64)info->refclk + info->vco1.max_inputfreq - 1) /
+ 		   info->vco1.max_inputfreq;
+ 	if (quotient > INT_MAX)
+ 		return -ERANGE;
+ 	lM = max((int)quotient, (int)info->vco1.min_m);
+-	quotient = ((u64)info->refclk + info->vco1.min_inputfreq) /
+-		   info->vco1.min_inputfreq;
++	quotient = info->refclk / info->vco1.min_inputfreq;
+ 	if (quotient > INT_MAX)
+ 		return -ERANGE;
+ 	hM = min((int)quotient, (int)info->vco1.max_m);
