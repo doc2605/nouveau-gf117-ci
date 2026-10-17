@@ -12,8 +12,11 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Install build tools
-        run: pacman -Syu --noconfirm --needed git clang llvm lld pahole python kmod curl zstd
+        run: pacman -Syu --noconfirm --needed git pahole python kmod curl zstd
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install pinned Clang LLVM and LLD 23.1.1
+        shell: bash
+        run: bash ci/install-toolchain.sh
       - name: Build exact CachyOS module and check source harnesses
         shell: bash
         run: bash ci/build-gf117-module.sh
