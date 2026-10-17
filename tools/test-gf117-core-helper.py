@@ -80,6 +80,10 @@ read_clocks
 [[ $core == 774 && $memory == 324 ]]
 printf 'core unknown MHz\\nmemory 324 MHz\\n' > "$debugfs/pstate_current"
 if read_clocks; then echo 'clock inválido aceito';exit 1;fi
+(
+ cat() { printf 'core 774 MHz\\nmemory 324 MHz\\n';return 2; }
+ if read_clocks; then echo 'amostra parcial com erro aceita';exit 1;fi
+)
 device="$1/gpu";hwmon_root="$1/hwmon";temperature_path='';temperature_source=''
 mkdir -p "$device" "$hwmon_root/hwmon4"
 printf 'dell_smm\\n' > "$hwmon_root/hwmon4/name"
@@ -105,6 +109,10 @@ mkdir -p "$device/hwmon/hwmon9"
 printf '47000\\n' > "$device/hwmon/hwmon9/temp1_input"
 read_temperature
 [[ $temperature_path == "$device/hwmon/hwmon9/temp1_input" && $temperature_source == nouveau && $temperature == 47000 ]]
+(
+ cat() { printf '47000\\n';return 2; }
+ if read_temperature; then echo 'erro de leitura da temperatura aceito';exit 1;fi
+)
 (
  memory_before=324;load_cursor=fake;reads=0
  sleep() { :; }

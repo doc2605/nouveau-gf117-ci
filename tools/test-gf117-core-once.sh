@@ -148,7 +148,9 @@ check_gpu_idle() {
 
 read_clocks() {
     local values
-    values=$(cat "$debugfs/pstate_current")
+    if ! values=$(cat "$debugfs/pstate_current"); then
+        echo "Falha lendo clocks; amostra parcial descartada." >&2; return 1
+    fi
     core=$(awk '$1=="core" && $3=="MHz" {print $2; exit}' <<< "$values")
     memory=$(awk '$1=="memory" && $3=="MHz" {print $2; exit}' <<< "$values")
     [[ "$core" =~ ^[0-9]+$ && "$memory" =~ ^[0-9]+$ ]] || {
@@ -211,7 +213,9 @@ select_temperature() {
 read_temperature() {
     [[ -n "$temperature_path" ]] || select_temperature
     [[ -r "$temperature_path" ]] || { echo "Sensor GPU desapareceu." >&2; return 1; }
-    temperature=$(cat "$temperature_path")
+    if ! temperature=$(cat "$temperature_path"); then
+        echo "Falha lendo a temperatura GPU." >&2; return 1
+    fi
     [[ "$temperature" =~ ^[0-9]+$ ]] && (( temperature > 0 && temperature < 80000 )) || {
         echo "Temperatura inválida ou acima do limite de teste (80 C): $temperature" >&2
         return 1
