@@ -9,55 +9,45 @@ readback or falling back to GPIO VID. Reclocking preflight must fail closed.
 
 --- a/drivers/gpu/drm/nouveau/nvkm/subdev/volt/gf117.c
 +++ b/drivers/gpu/drm/nouveau/nvkm/subdev/volt/gf117.c
-@@ -34,24 +34,6 @@
- };
- 
- static int
+@@ -37,28 +36,0 @@
 -gf117_volt_pwm_get(struct nvkm_volt *base)
 -{
 -	struct gf117_volt *volt = container_of(base, struct gf117_volt, base);
 -	struct nvkm_device *device = base->subdev.device;
 -	u32 div = nvkm_rd32(device, 0x20340);
--	u32 duty = nvkm_rd32(device, 0x20344) & 0x7fffffff;
+-	u32 raw = nvkm_rd32(device, 0x20344);
+-	u32 duty = raw & 0x7fffffff;
 -	u64 uv;
 -
 -	/* This mode is read-only until GF117 PWM programming is validated. */
--	if (!div || duty > div)
+-	if (!div || duty > div) {
+-		nvkm_error_ratelimited(&base->subdev,
+-				       "GF117 PWM readback invalid: div=%08x raw=%08x duty=%u\n",
+-				       div, raw, duty);
 -		return -ERANGE;
+-	}
 -	uv = volt->bios.base + div64_u64((u64)volt->bios.pwm_range * duty, div);
--	if (uv < base->min_uv || uv > base->max_uv || uv > INT_MAX)
+-	if (uv < base->min_uv || uv > base->max_uv || uv > INT_MAX) {
+-		nvkm_error_ratelimited(&base->subdev,
+-				       "GF117 PWM readback out of range: uv=%llu base=%u range=%u min=%u max=%u\n",
+-				       uv, volt->bios.base, volt->bios.pwm_range,
+-				       base->min_uv, base->max_uv);
 -		return -ERANGE;
+-	}
 -	return (int)uv;
 -}
 -
 -static int
- gf117_volt_speedo_read(struct nvkm_volt *volt)
- {
- 	struct nvkm_device *device = volt->subdev.device;
-@@ -68,10 +50,6 @@
- 	.vid_get = nvkm_voltgpio_get,
- 	.vid_set = nvkm_voltgpio_set,
- 	.speedo_read = gf117_volt_speedo_read,
+@@ -81,4 +52,0 @@
 -}, gf117_volt_pwm = {
 -	.oneinit = gf100_volt_oneinit,
 -	.volt_get = gf117_volt_pwm_get,
 -	.speedo_read = gf117_volt_speedo_read,
- };
- 
- int
-@@ -81,25 +59,16 @@
- 	const struct nvkm_volt_func *func = &gf117_volt_gpio;
- 	struct gf117_volt *volt;
- 	struct nvbios_volt bios;
+@@ -94 +61,0 @@
 -	struct dcb_gpio_func gpio;
- 	u8 ver, hdr, cnt, len;
+@@ -96 +62,0 @@
 -	bool pwm = false;
- 	int ret = 0;
- 	*pvolt = NULL;
- 
- 	if (device->bios &&
- 	    nvbios_volt_parse(device->bios, &ver, &hdr, &cnt, &len, &bios) &&
- 	    bios.type == NVBIOS_VOLT_PWM) {
+@@ -103,10 +69,3 @@
 -		if (bios.base && bios.pwm_range && bios.pwm_freq &&
 -		    bios.base <= INT_MAX && bios.pwm_range <= INT_MAX - bios.base &&
 -		    device->gpio &&
@@ -71,13 +61,7 @@ readback or falling back to GPIO VID. Reclocking preflight must fail closed.
 +		/* GF117 PWM register layout/readback is unverified. Do not mistake
 +		 * GPIO VID or another chipset's PWM registers for voltage. */
 +		return 0;
- 	}
- 
- 	volt = kzalloc_obj(*volt);
-@@ -107,12 +76,7 @@
- 		return -ENOMEM;
- 	nvkm_volt_ctor(func, device, type, inst, &volt->base);
- 	*pvolt = &volt->base;
+@@ -120,6 +79 @@
 -	if (pwm) {
 -		volt->bios = bios;
 -		nvkm_info(&volt->base.subdev, "GF117 VBIOS PWM voltage readback enabled (read-only)\n");
@@ -85,6 +69,3 @@ readback or falling back to GPIO VID. Reclocking preflight must fail closed.
 -		ret = nvkm_voltgpio_init(&volt->base);
 -	}
 +	ret = nvkm_voltgpio_init(&volt->base);
- 
- 	return ret;
- }
