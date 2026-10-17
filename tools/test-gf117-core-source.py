@@ -24,8 +24,11 @@ common=r'''
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
-typedef uint32_t u32;
-struct nvkm_volt { int uv,target,set_error; bool unreadable,stuck; };
+typedef uint8_t u8;typedef uint32_t u32;
+#define min(a,b) ((a)<(b)?(a):(b))
+#define ARRAY_SIZE(a) (int)(sizeof(a)/sizeof((a)[0]))
+#include <limits.h>
+struct nvkm_volt { int uv,target,set_error; bool unreadable,stuck; u32 max_uv; u8 max0_id,max1_id,max2_id,vid_nr;struct {u32 uv;} vid[4]; };
 struct nvkm_therm { int unused; };
 struct nvkm_clk;
 struct nvkm_cstate { int voltage; };
@@ -53,7 +56,7 @@ static int calc_error,prog_error;
 static int nvkm_therm_cstate(struct nvkm_therm *t,int f,int direction)
 { (void)t;(void)f;if(direction>0)fan_raise++;else fan_lower++;return 0; }
 static int nvkm_volt_get(struct nvkm_volt *v) { return v->unreadable?-ENODEV:v->uv; }
-static int nvkm_volt_map(struct nvkm_volt *v,int id,int temp) { (void)id;(void)temp;return v->target; }
+static int nvkm_volt_map(struct nvkm_volt *v,int id,int temp) { (void)temp;if(id==42)return 950000;if(id==43)return -EIO;return v->target; }
 static int nvkm_volt_set_id(struct nvkm_volt *v,int id,int min,int temp,int direction)
 { (void)id;(void)min;(void)temp;if(direction>0)volt_raise++;else volt_lower++;
   if(v->set_error)return v->set_error;
@@ -66,7 +69,7 @@ static void mock_tidy(struct nvkm_clk *c) { (void)c;tidy_calls++; }
 '''
 voltage_tests=r'''
 int main(void) {
- struct nvkm_volt volt={.uv=900000,.target=850000};
+ struct nvkm_volt volt={.uv=900000,.target=850000,.max_uv=1200000,.max0_id=0xff,.max1_id=0xff,.max2_id=0xff,.vid_nr=1,.vid={{1000000}}};
  struct nvkm_therm therm={0};
  struct nvkm_device dev={.chipset=0xd7,.volt=&volt,.therm=&therm};
  struct nvkm_clk_func ops={.calc=mock_calc,.prog=mock_prog,.tidy=mock_tidy};
@@ -92,7 +95,16 @@ int main(void) {
  int old_prog=prog_calls;prog_error=0;calc_error=-EINVAL;
  assert(nvkm_cstate_prog(&clk,&state,0)==-EINVAL && prog_calls==old_prog);
  assert(volt_lower==0 && fan_lower==0);
- calc_error=0;dev.chipset=0xe0;
+ calc_error=0;volt.uv=900000;volt.max0_id=42;int old_raise=volt_raise;
+ assert(nvkm_cstate_prog(&clk,&state,0)==-ERANGE && volt_raise==old_raise);
+ volt.target=950000;volt.vid[0].uv=1000000;
+ assert(nvkm_cstate_prog(&clk,&state,0)==-ERANGE && volt_raise==old_raise);
+ volt.max0_id=43;
+ assert(nvkm_cstate_prog(&clk,&state,0)==-EIO && volt_raise==old_raise);
+ volt.max0_id=0xff;volt.max_uv=0;
+ assert(nvkm_cstate_prog(&clk,&state,0)==-ERANGE && volt_raise==old_raise);
+ volt.max_uv=1200000;volt.target=1000000;
+ dev.chipset=0xe0;
  assert(nvkm_cstate_prog(&clk,&state,0)==0 && boost_queries==1);
  puts("ok: actual cstate path rejects missing/unreadable/insufficient voltage before clock writes");
  puts("ok: core-only retains boot voltage/cooling and raised voltage on calculation/PLL errors");
@@ -156,6 +168,9 @@ int main(void) {
  return 0;
 }
 '''
+volt_text=(a.source/'drivers/gpu/drm/nouveau/nvkm/subdev/volt/base.c').read_text()
+vstart=volt_text.index('\nnvkm_volt_preflight(')+1;vend=volt_text.index('\n}',vstart)+2
+common+='int\n'+volt_text[vstart:vend]+'\n'
 voltage = common+function('base.c','nvkm_clk_fermi_core_only','bool')+function('base.c','nvkm_cstate_prog')+voltage_tests
 pll = pll_prelude+function('gf100.c','read_pll','u32')+''.join(function('gf100.c','gf100_clk_prog_'+str(i)) for i in range(5))+function('gf100.c','gf100_clk_prog')+pll_tests
 with tempfile.TemporaryDirectory(prefix='gf117-core-test-') as d:

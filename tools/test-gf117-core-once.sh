@@ -11,8 +11,8 @@ case "${1:-}" in
     *) echo "Argumento inválido; use --help" >&2; exit 2 ;;
 esac
 [[ $EUID == 0 ]] || { echo "Execute com sudo." >&2; exit 2; }
-module=/home/doc/Nvidia-GT720M-Fix-atualizado/artifacts/build-7.2.9-2/cachyos-7.2.9-2/drivers/gpu/drm/nouveau/nouveau.ko
-expected_hash=80d7a85a8f0d9b8c52a261e79b7493c9a75468367e66c9bc457ac45e9e4ba9eb
+module=/home/doc/Nvidia-GT720M-Fix-atualizado/artifacts/github-actions/38990375809/gf117-nouveau-658cd72c1808b8f8882f42ccf7da80bb42b7cb23/nouveau.ko
+expected_hash=9b51a5257f4c33e3fe75f295e0230e9117ca0655d405381818cc41a979919dde
 device=/sys/bus/pci/devices/0000:08:00.0
 debugfs=/sys/kernel/debug/dri/0000:08:00.0
 hwmon_root=/sys/class/hwmon
@@ -52,25 +52,53 @@ new_kernel_log() {
     journalctl -k --after-cursor "$1" --no-pager -o short-iso
 }
 check_faults() {
-    local cursor=$1 lines
-    lines=$(new_kernel_log "$cursor")
-    if printf '%s\n' "$lines" | rg -qi \
-        "$kernel_fault_pattern"; then
+    local cursor=$1 lines result
+    if ! lines=$(new_kernel_log "$cursor"); then
+        echo "Falha lendo o journal; estado de faults não verificável." >&2
+        return 1
+    fi
+    # No early-exit pipe: with pipefail, rg -q could give printf SIGPIPE and
+    # turn a positive fault match into a false negative on a large journal.
+    if rg -i "$kernel_fault_pattern" <<< "$lines" >/dev/null; then
         echo "Novos faults/erros do kernel; interrompendo o teste."
         printf '%s\n' "$lines"
         return 1
+    else
+        result=$?
+        if (( result != 1 )); then
+            echo "Falha pesquisando faults; teste interrompido." >&2
+            return 1
+        fi
     fi
 }
 check_stock_unload_faults() {
-    local lines events unexpected count gr_count
+    local lines events unexpected count gr_count result
     (( stock_removed && !custom_loaded )) || return 1
-    lines=$(new_kernel_log "$1")
-    events=$(printf '%s\n' "$lines" | rg -i "$kernel_fault_pattern" || true)
-    [[ -n "$events" ]] || return 0
-    unexpected=$(printf '%s\n' "$events" | rg -vi "$stock_vga_pattern|$stock_gr_pattern" || true)
-    count=$(printf '%s\n' "$events" | rg -ci "$stock_vga_pattern" || true)
-    gr_count=$(printf '%s\n' "$events" | rg -ci "$stock_gr_pattern" || true)
-    if [[ -z "$unexpected" ]] && (( count <= 2 && gr_count <= 1 && count + gr_count >= 1 )); then
+    if ! lines=$(new_kernel_log "$1"); then
+        echo "Falha lendo journal da remoção original." >&2; return 1
+    fi
+    if events=$(rg -i "$kernel_fault_pattern" <<< "$lines"); then
+        :
+    else
+        result=$?
+        if (( result == 1 )); then return 0; fi
+        echo "Falha pesquisando journal original." >&2; return 1
+    fi
+    if unexpected=$(rg -vi "$stock_vga_pattern|$stock_gr_pattern" <<< "$events"); then
+        echo "Erro inesperado removendo o módulo original; teste interrompido."
+        printf '%s\n' "$lines"
+        return 1
+    else
+        result=$?
+        (( result == 1 )) || return 1
+    fi
+    if count=$(rg -ci "$stock_vga_pattern" <<< "$events"); then :; else
+        result=$?; (( result == 1 )) || return 1; count=0
+    fi
+    if gr_count=$(rg -ci "$stock_gr_pattern" <<< "$events"); then :; else
+        result=$?; (( result == 1 )) || return 1; gr_count=0
+    fi
+    if (( count <= 2 && gr_count <= 1 && count + gr_count >= 1 )); then
         echo "Falhas conhecidas do módulo ORIGINAL durante a remoção (VGA=$count GR=$gr_count):"
         printf '%s\n' "$events"
         echo "GR original não corrigido: o teste usa noaccel=1. Qualquer fault experimental continua fatal."
@@ -80,6 +108,7 @@ check_stock_unload_faults() {
     printf '%s\n' "$lines"
     return 1
 }
+
 check_voltage_plan() {
     local state line
     state=$(awk '/ requested_core_khz=775000 / { print $1 }' <<< "$plan")
@@ -92,6 +121,29 @@ check_voltage_plan() {
         echo "Regulador/tensão alvo indisponível. Nenhum clock será solicitado." >&2
         return 1
     }
+}
+
+check_gpu_idle() {
+    local node=$1 errors result
+    errors=$(mktemp) || return 1
+    if fuser "$node" >/dev/null 2>"$errors"; then
+        rm -f "$errors"
+        echo "GPU ocupada: $node"
+        fuser -v "$node" || true
+        echo "Feche os processos indicados; execute no TTY."
+        return 1
+    else
+        result=$?
+        # fuser uses 1 for both no users and some errors. Require empty
+        # stderr as well, rather than treating every failure as an idle GPU.
+        if (( result != 1 )) || [[ -s "$errors" ]]; then
+            echo "Não foi possível verificar o uso da GPU: $node" >&2
+            cat "$errors" >&2
+            rm -f "$errors"
+            return 1
+        fi
+    fi
+    rm -f "$errors"
 }
 
 read_clocks() {
@@ -232,11 +284,8 @@ pci_path=$(readlink -f "$device")
 for node in /dev/dri/card* /dev/dri/renderD*; do
     [[ -e "$node" ]] || continue
     node_device=$(readlink -f "/sys/class/drm/$(basename "$node")/device" || true)
-    if [[ "$node_device" == "$pci_path" ]] && fuser -s "$node"; then
-        echo "GPU ocupada: $node"
-        fuser -v "$node" || true
-        echo "Feche os processos indicados; execute no TTY."
-        exit 1
+    if [[ "$node_device" == "$pci_path" ]]; then
+        check_gpu_idle "$node" || exit 1
     fi
 done
 original_noaccel=$(cat /sys/module/nouveau/parameters/noaccel)

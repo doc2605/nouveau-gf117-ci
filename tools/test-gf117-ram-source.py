@@ -69,7 +69,7 @@ struct nvkm_pstate { struct nvkm_cstate base; int pcie_speed, pcie_width; };
 struct nvkm_clk {
  struct nvkm_subdev subdev;
  struct { struct nvkm_pstate *one; } states;
- int pstate;
+ int pstate,state_nr;
 };
 #define list_for_each_entry(p,h,m) for ((p)=(h)->one; (p); (p)=NULL)
 struct nvkm_device {
@@ -113,13 +113,16 @@ tests = r'''
 int main(void) {
  struct nvkm_bios bios={0};
  struct nvkm_device dev={.bios=&bios,.chipset=0xd7};
- struct nvkm_clk clk={.subdev={.device=&dev},.pstate=-1};
+ struct nvkm_clk clk={.subdev={.device=&dev},.pstate=-1,.state_nr=1};
  struct nvkm_ram_func ops={.calc=ram_calc,.prog=ram_prog,.tidy=ram_tidy};
  struct nvkm_fb fb={.subdev={.device=&dev}};
  struct gf100_ram ram={.base={.fb=&fb,.func=&ops}};
  struct nvkm_pstate state={.base={.domain={1001000}}};
  struct nvkm_ram_dryrun plan;
  dev.clk=&clk;dev.fb=&fb;fb.ram=&ram.base;clk.states.one=&state;
+ assert(nvkm_pstate_prog(&clk,-1)==-EINVAL);
+ assert(nvkm_pstate_prog(&clk,1)==-EINVAL);
+ assert(reads==0 && pcie_writes==0 && core_writes==0);
  /* GF117's config 1: ID at byte 0, flags at byte 1 must be ignored. */
  bios.bytes[0x100+0x13+10]=2;bios.bytes[0x100+0x13+10+1]=16;
  assert(gf100_ram_dryrun(&ram.base,1001000,&plan)==-EOPNOTSUPP);

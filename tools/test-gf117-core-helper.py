@@ -11,7 +11,17 @@ constants='\n'.join(x for x in s.splitlines() if x.startswith(('kernel_fault_pat
 body='set -euo pipefail\n'+constants+'''
 stock_removed=1;custom_loaded=0
 new_kernel_log() { printf '%s\\n' "$journal_fixture"; }
-'''+function('check_voltage_plan')+function('check_faults')+function('check_stock_unload_faults')+function('read_clocks')+function('select_temperature')+function('read_temperature')+function('wait_target_clock')+'''
+'''+function('check_voltage_plan')+function('check_faults')+function('check_stock_unload_faults')+function('check_gpu_idle')+function('read_clocks')+function('select_temperature')+function('read_temperature')+function('wait_target_clock')+'''
+(
+ fuser() { return 1; }
+ check_gpu_idle fake
+ fuser() { return 0; }
+ if check_gpu_idle fake; then echo 'GPU ocupada aceita';exit 1;fi
+ fuser() { echo 'cannot stat GPU' >&2;return 1; }
+ if check_gpu_idle fake; then echo 'erro fuser aceito';exit 1;fi
+ fuser() { return 2; }
+ if check_gpu_idle fake; then echo 'erro fatal fuser aceito';exit 1;fi
+)
 plan='state=1 id=0 voltage=17 requested_core_khz=775000 calculated_core_khz=774264 requested_memory_khz=1001000
 state=1 voltage_uv=850000 target_uv=850000 voltage_ready=1 voltage_temp_c=90'
 check_voltage_plan
@@ -48,6 +58,20 @@ journal_fixture="$known
 $known
 $known"
 if check_stock_unload_faults fake; then echo 'falhas repetidas aceitas';exit 1;fi
+journal_fixture="$known
+$(printf '%1048576s' x)"
+if check_faults fake; then echo 'journal grande com fault aceito';exit 1;fi
+(
+ new_kernel_log() { return 2; }
+ if check_faults fake; then echo 'erro journal experimental aceito';exit 1;fi
+ if check_stock_unload_faults fake; then echo 'erro journal original aceito';exit 1;fi
+)
+(
+ journal_fixture=$known
+ rg() { return 2; }
+ if check_faults fake; then echo 'erro rg experimental aceito';exit 1;fi
+ if check_stock_unload_faults fake; then echo 'erro rg original aceito';exit 1;fi
+)
 custom_loaded=1;journal_fixture=$known
 if check_stock_unload_faults fake; then echo 'exceção aplicada no módulo novo';exit 1;fi
 debugfs=$1

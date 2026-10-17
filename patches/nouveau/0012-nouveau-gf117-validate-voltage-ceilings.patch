@@ -1,0 +1,156 @@
+Subject: [PATCH] Apply all VBIOS voltage ceilings before GF117 VID writes
+
+--- a/drivers/gpu/drm/nouveau/include/nvkm/subdev/volt.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/subdev/volt.h
+@@ -33,6 +33,9 @@
+ int nvkm_volt_map(struct nvkm_volt *volt, u8 id, u8 temperature);
+ int nvkm_volt_map_min(struct nvkm_volt *volt, u8 id);
+ int nvkm_volt_get(struct nvkm_volt *);
++/* Read-only GPIO-VID preflight used by the GF117 experiment. */
++int nvkm_volt_preflight(struct nvkm_volt *, u8 id, u8 temperature,
++			int *current_uv, int *limit_uv);
+ int nvkm_volt_set_id(struct nvkm_volt *, u8 id, u8 min_id, u8 temp,
+ 		     int condition);
+ 
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/volt/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/volt/base.c
+@@ -156,6 +156,54 @@
+ 	return id ? id * 10000 : -ENODEV;
+ }
+ 
++/* Only the GF117 GPIO-VID experiment calls this. Validate both the requested
++ * voltage and the rounded VID before any setter can modify the regulator. */
++int
++nvkm_volt_preflight(struct nvkm_volt *volt, u8 id, u8 temp,
++		    int *current_uv, int *limit_uv)
++{
++	u8 ids[3];
++	int target, cap, i;
++
++	if (!current_uv || !limit_uv)
++		return -EINVAL;
++	*current_uv = -ENODEV;
++	*limit_uv = 0;
++	if (!volt)
++		return -ENODEV;
++	*current_uv = nvkm_volt_get(volt);
++	if (*current_uv <= 0)
++		return *current_uv ? *current_uv : -ERANGE;
++	target = nvkm_volt_map(volt, id, temp);
++	if (target <= 0)
++		return target ? target : -ERANGE;
++	if (!volt->max_uv || volt->max_uv > INT_MAX)
++		return -ERANGE;
++	cap = volt->max_uv;
++	ids[0] = volt->max0_id;
++	ids[1] = volt->max1_id;
++	ids[2] = volt->max2_id;
++	for (i = 0; i < ARRAY_SIZE(ids); i++) {
++		if (ids[i] != 0xff) {
++			int mapped = nvkm_volt_map(volt, ids[i], temp);
++
++			if (mapped <= 0)
++				return mapped ? mapped : -ERANGE;
++			cap = min(cap, mapped);
++		}
++	}
++	*limit_uv = cap;
++	if (target > cap || *current_uv > cap)
++		return -ERANGE;
++	if (*current_uv >= target)
++		return target;
++	for (i = 0; i < volt->vid_nr; i++) {
++		if (volt->vid[i].uv >= (u32)target && volt->vid[i].uv <= (u32)cap)
++			return target;
++	}
++	return -ERANGE;
++}
++
+ int
+ nvkm_volt_set_id(struct nvkm_volt *volt, u8 id, u8 min_id, u8 temp,
+ 		 int condition)
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/clk/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/clk/base.c
+@@ -176,7 +176,8 @@
+ 	struct nvkm_volt *volt = device->volt;
+ 	struct nvkm_cstate *cstate;
+ 	bool core_only = nvkm_clk_fermi_core_only(clk);
+-	int ret, target_uv = 0;
++	int ret, target_uv = 0, current_uv, limit_uv = 0;
++	u8 temp = clk->temp;
+ 
+ 	if (!core_only && !list_empty(&pstate->list)) {
+ 		cstate = nvkm_cstate_get(clk, pstate, cstatei);
+@@ -188,10 +189,8 @@
+ 	}
+ 
+ 	if (core_only) {
+-		/* A missing/unreadable regulator must not be treated as success. */
+-		if (!volt || nvkm_volt_get(volt) <= 0)
+-			return -ENODEV;
+-		target_uv = nvkm_volt_map(volt, cstate->voltage, clk->temp);
++		target_uv = nvkm_volt_preflight(volt, cstate->voltage, temp,
++						&current_uv, &limit_uv);
+ 		if (target_uv <= 0)
+ 			return target_uv ? target_uv : -ERANGE;
+ 	}
+@@ -206,15 +205,18 @@
+ 
+ 	if (volt) {
+ 		ret = nvkm_volt_set_id(volt, cstate->voltage,
+-				       pstate->base.voltage, clk->temp, +1);
++				       pstate->base.voltage, core_only ? temp : clk->temp, +1);
+ 		if (ret && (core_only || ret != -ENODEV)) {
+ 			nvkm_error(subdev, "failed to raise voltage: %d\n", ret);
+ 			return ret;
+ 		}
+ 	}
+ 
+-	if (core_only && nvkm_volt_get(volt) < target_uv)
+-		return -ERANGE;
++	if (core_only) {
++		current_uv = nvkm_volt_get(volt);
++		if (current_uv < target_uv || current_uv > limit_uv)
++			return -ERANGE;
++	}
+ 
+ 	ret = clk->func->calc(clk, cstate);
+ 	if (ret == 0) {
+--- a/drivers/gpu/drm/nouveau/nouveau_debugfs.c
++++ b/drivers/gpu/drm/nouveau/nouveau_debugfs.c
+@@ -207,7 +207,7 @@
+ 		int ret = nvkm_clk_dryrun(clk, state, &cstate);
+ 		int ram_ret;
+ 		struct nvkm_volt *volt = nvxx_volt(ndrm);
+-		int voltage_uv, target_uv, voltage_ready = 0, vid;
++		int voltage_uv, target_uv, limit_uv = 0, voltage_ready;
+ 
+ 		if (ret) {
+ 			seq_printf(m, "state=%d dryrun_error=%d\n", state, ret);
+@@ -223,21 +223,16 @@
+ 			   cstate.domain[nv_clk_src_gpc] / 2,
+ 			   requested_memory);
+ 		if (nvxx_device(ndrm)->chipset == 0xd7) {
+-			/* Read-only regulator preflight; no VID writes here. GF117 uses GPIO VIDs. */
+-			voltage_uv = volt ? nvkm_volt_get(volt) : -ENODEV;
++			voltage_ready = nvkm_volt_preflight(volt, pstate->base.voltage,
++							clk->temp, &voltage_uv, &limit_uv) > 0;
+ 			target_uv = volt ? nvkm_volt_map(volt, pstate->base.voltage,
+ 							 clk->temp) : -ENODEV;
+-			if (voltage_uv > 0 && target_uv > 0) {
+-				voltage_ready = voltage_uv >= target_uv;
+-				for (vid = 0; vid < volt->vid_nr; vid++) {
+-					if (volt->vid[vid].uv >= target_uv &&
+-					    volt->vid[vid].uv <= volt->max_uv)
+-						voltage_ready = 1;
+-				}
+-			}
+ 			seq_printf(m, "state=%d voltage_uv=%d target_uv=%d voltage_ready=%d "
+ 				   "voltage_temp_c=%u\n", state, voltage_uv, target_uv,
+ 				   voltage_ready, clk->temp);
++			seq_printf(m, "state=%d voltage_limit_uv=%d vid_mask=%u vid_count=%u\n",
++				   state, limit_uv, volt ? volt->vid_mask : 0,
++				   volt ? volt->vid_nr : 0);
+ 		}
+ 
+ 		if (ram_ret)

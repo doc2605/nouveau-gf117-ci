@@ -1,0 +1,99 @@
+Subject: [PATCH] GF117 completion/error latch and reject invalid pstate/PLL ranges
+
+--- a/drivers/gpu/drm/nouveau/include/nvkm/subdev/clk.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/subdev/clk.h
+@@ -92,6 +92,8 @@
+ 	struct work_struct work;
+ 	wait_queue_head_t wait;
+ 	atomic_t waiting;
++	/* Experimental GF117 failures latch until device reconstruction. */
++	int fermi_reclock_error;
+ 
+ 	int pwrsrc;
+ 	int pstate; /* current */
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/clk/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/clk/base.c
+@@ -303,6 +303,9 @@
+ 	struct nvkm_pstate *pstate;
+ 	int ret, idx = 0;
+ 
++	if (pstatei < 0 || pstatei >= clk->state_nr)
++		return -EINVAL;
++
+ 	list_for_each_entry(pstate, &clk->states, head) {
+ 		if (idx++ == pstatei)
+ 			break;
+@@ -390,6 +393,9 @@
+ 
+ 	if (!atomic_xchg(&clk->waiting, 0))
+ 		return;
++	if (nvkm_clk_fermi_core_only(clk) && READ_ONCE(clk->fermi_reclock_error))
++		goto done;
++
+ 	clk->pwrsrc = power_supply_is_system_supplied();
+ 
+ 	nvkm_trace(subdev, "P %d PWR %d U(AC) %d U(DC) %d A %d T %d°C D %d\n",
+@@ -409,21 +415,35 @@
+ 	if (pstate != clk->pstate) {
+ 		int ret = nvkm_pstate_prog(clk, pstate);
+ 		if (ret) {
++			if (nvkm_clk_fermi_core_only(clk))
++				WRITE_ONCE(clk->fermi_reclock_error, ret);
++
+ 			nvkm_error(subdev, "error setting pstate %d: %d\n",
+ 				   pstate, ret);
+ 		}
+ 	}
+ 
++done:
+ 	wake_up_all(&clk->wait);
+ }
+ 
+ static int
+ nvkm_pstate_calc(struct nvkm_clk *clk, bool wait)
+ {
++	if (nvkm_clk_fermi_core_only(clk) && READ_ONCE(clk->fermi_reclock_error))
++		return READ_ONCE(clk->fermi_reclock_error);
++
+ 	atomic_set(&clk->waiting, 1);
+ 	schedule_work(&clk->work);
+-	if (wait)
++	if (wait) {
++		if (nvkm_clk_fermi_core_only(clk)) {
++			/* waiting is consumed at worker entry, before any programming.
++			 * Flush the queued work so userspace gets the completed result. */
++			flush_work(&clk->work);
++			return READ_ONCE(clk->fermi_reclock_error);
++		}
+ 		wait_event(clk->wait, !atomic_read(&clk->waiting));
++	}
+ 	return 0;
+ }
+ 
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/clk/pllgt215.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/clk/pllgt215.c
+@@ -40,8 +40,12 @@
+ 	    !info->vco1.max_inputfreq || info->vco1.min_m > info->vco1.max_m ||
+ 	    !info->vco1.min_m || !info->vco1.min_n ||
+ 	    info->vco1.min_n > info->vco1.max_n || !info->min_p ||
+-	    !info->max_p || info->min_p > info->max_p)
++	    !info->max_p || info->min_p > info->max_p ||
++	    info->vco1.min_inputfreq > info->vco1.max_inputfreq)
+ 		return -EINVAL;
++
++	if (freq > INT_MAX)
++		return -ERANGE;
+ 
+ 	*P = info->vco1.max_freq / freq;
+ 	if (*P > info->max_p)
+@@ -61,7 +65,9 @@
+ 	if (quotient > INT_MAX)
+ 		return -ERANGE;
+ 	hM = min((int)quotient, (int)info->vco1.max_m);
+-	lM = min(lM, hM);
++	/* Never relax the VBIOS minimum M to repair an empty interval. */
++	if (lM > hM)
++		return -ERANGE;
+ 
+ 	for (M = lM; M <= hM; M++) {
+ 		numerator = (u64)freq * *P * M;

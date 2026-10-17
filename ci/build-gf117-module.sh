@@ -18,7 +18,7 @@ src="$repo/work/cachyos-7.2.9-2"
 for patch in "$repo"/patches/nouveau/*.patch; do
     patch --batch --fuzz=0 -d "$src" -p1 -i "$patch"
 done
-for test in core ram vga crtc; do
+for test in core ram vga crtc worker pll; do
     python "tools/test-gf117-$test-source.py" "$src"
 done
 python tools/test-gf117-core-helper.py
