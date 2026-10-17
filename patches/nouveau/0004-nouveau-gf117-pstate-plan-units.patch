@@ -1,0 +1,58 @@
+From: Codex <noreply@openai.com>
+Subject: [PATCH] nouveau: report GF100 core clocks in physical units
+
+GF100 stores the GPC core domain at twice its physical clock rate. Report
+normalized core kHz in the diagnostic plan, and include the RAMMAP version
+when the existing GF100 RAM path rejects an unsupported version.
+
+--- a/drivers/gpu/drm/nouveau/nouveau_debugfs.c
++++ b/drivers/gpu/drm/nouveau/nouveau_debugfs.c
+@@ -198,7 +198,9 @@
+ 	list_for_each_entry(pstate, &clk->states, head) {
+ 		struct nvkm_cstate cstate;
+ 		struct nvkm_ram_dryrun ram;
+-		u32 requested_core = pstate->base.domain[nv_clk_src_gpc];
++		/* GF100's core domain is represented at 2x the physical GPC clock. */
++		u32 requested_core_khz =
++			pstate->base.domain[nv_clk_src_gpc] / 2;
+ 		u32 requested_memory = pstate->base.domain[nv_clk_src_mem];
+ 		int state = i++;
+ 		int ret = nvkm_clk_dryrun(clk, state, &cstate);
+@@ -211,14 +213,15 @@
+ 
+ 		ram_ret = fb && fb->ram ? nvkm_ram_dryrun(fb->ram, requested_memory,
+ 							 &ram) : -ENODEV;
+-		seq_printf(m, "state=%d id=%u voltage=%u requested_core=%u "
+-			   "calculated_core=%u requested_memory=%u\n", state, cstate.id,
++		seq_printf(m, "state=%d id=%u voltage=%u requested_core_khz=%u "
++			   "calculated_core_khz=%u requested_memory_khz=%u\n", state, cstate.id,
+ 			   cstate.voltage,
+-			   requested_core,
+-			   cstate.domain[nv_clk_src_gpc],
++			   requested_core_khz,
++			   cstate.domain[nv_clk_src_gpc] / 2,
+ 			   requested_memory);
+ 		if (ram_ret)
+-			seq_printf(m, "state=%d ram_dryrun_error=%d\n", state, ram_ret);
++			seq_printf(m, "state=%d ram_dryrun_error=%d rammap_ver=%u\n",
++				   state, ram_ret, ram.rammap_ver);
+ 		else
+ 			seq_printf(m, "state=%d rammap_ver=%u strap=%u timing_ver=%u "
+ 				   "timing_present=%u ref_khz=%u rounded_memory=%u\n",
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/fb/ramgf100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/fb/ramgf100.c
+@@ -428,9 +428,13 @@
+ 	 * before ram_init(), RAMFUC construction, PLL programming or any writes. */
+ 	rammap.data = nvbios_rammapEm(bios, freq / 1000, &ver, &rammap.size,
+ 				      &cnt, &ramcfg.size, &cfg);
+-	if (!rammap.data || ver != 0x10 || rammap.size < 0x0e)
++	if (!rammap.data)
+ 		return -EINVAL;
+ 	out->rammap_ver = ver;
++	if (ver != 0x10)
++		return -EOPNOTSUPP;
++	if (rammap.size < 0x0e)
++		return -EINVAL;
+ 
+ 	strap = nvbios_ramcfg_index(subdev);
+ 	if (strap >= cnt)

@@ -1,0 +1,56 @@
+From: Codex <noreply@openai.com>
+Subject: [PATCH] nouveau: filter GF117 CRTC ports and VBIOS MMIO accesses
+
+Lockvgac is not the only route to 0x6013d4. Prevent CRTC port accesses
+on headless GF117 and use the devinit MMIO mapping callback to return
+the interpreter's ~0U skip sentinel for the aligned CRTC register word.
+Do not write register zero, suppress bus faults, or change other chipsets.
+
+The guard matches the observed inaccessible legacy VGA register. The next
+hardware run must still show whether this eliminates the remaining fault.
+
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/vga.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/vga.c
+@@ -26,6 +26,9 @@
+ u8
+ nvkm_rdport(struct nvkm_device *device, int head, u16 port)
+ {
++	if (device->chipset == 0xd7 && (port == 0x03d4 || port == 0x03d5))
++		return 0;
++
+ 	if (device->card_type >= NV_50)
+ 		return nvkm_rd08(device, 0x601000 + port);
+ 
+@@ -48,6 +51,9 @@
+ void
+ nvkm_wrport(struct nvkm_device *device, int head, u16 port, u8 data)
+ {
++	if (device->chipset == 0xd7 && (port == 0x03d4 || port == 0x03d5))
++		return;
++
+ 	if (device->card_type >= NV_50)
+ 		nvkm_wr08(device, 0x601000 + port, data);
+ 	else
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/devinit/gf100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/devinit/gf100.c
+@@ -101,8 +101,20 @@
+ 	base->post = ((nvkm_rd32(device, 0x2240c) & BIT(1)) == 0);
+ }
+ 
++/* The VBIOS interpreter can also reach the legacy CRTC index/data pair
++ * through direct MMIO opcodes, bypassing the VGA port helpers. */
++static u32
++gf100_devinit_mmio(struct nvkm_devinit *init, u32 addr)
++{
++	if (init->subdev.device->chipset == 0xd7 &&
++	    (addr & ~3U) == 0x6013d4)
++		return ~0U; /* interpreter sentinel: skip access, not register zero */
++	return addr;
++}
++
+ static const struct nvkm_devinit_func
+ gf100_devinit = {
++	.mmio = gf100_devinit_mmio,
+ 	.preinit = gf100_devinit_preinit,
+ 	.init = nv50_devinit_init,
+ 	.post = nv04_devinit_post,

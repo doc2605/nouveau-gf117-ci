@@ -1,0 +1,432 @@
+--- a/drivers/gpu/drm/nouveau/include/nvkm/subdev/clk.h	2026-10-03 12:48:53.000000000 +0000
++++ b/drivers/gpu/drm/nouveau/include/nvkm/subdev/clk.h	2026-10-10 18:02:10.470537873 +0000
+@@ -118,6 +118,8 @@
+ };
+ 
+ int nvkm_clk_read(struct nvkm_clk *, enum nv_clk_src);
++/* Read-only calculation; it never calls a prog or RAMFUC callback. */
++int nvkm_clk_dryrun(struct nvkm_clk *, int pstate, struct nvkm_cstate *);
+ int nvkm_clk_ustate(struct nvkm_clk *, int req, int pwr);
+ int nvkm_clk_astate(struct nvkm_clk *, int req, int rel, bool wait);
+ int nvkm_clk_dstate(struct nvkm_clk *, int req, int rel);
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/clk/priv.h	2026-10-03 12:48:53.000000000 +0000
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/clk/priv.h	2026-10-10 18:02:09.842566354 +0000
+@@ -9,6 +9,8 @@
+ 	void (*fini)(struct nvkm_clk *);
+ 	int (*read)(struct nvkm_clk *, enum nv_clk_src);
+ 	int (*calc)(struct nvkm_clk *, struct nvkm_cstate *);
++	/* Calculate a cstate without programming clocks or memory. */
++	int (*dryrun)(struct nvkm_clk *, struct nvkm_cstate *);
+ 	int (*prog)(struct nvkm_clk *);
+ 	void (*tidy)(struct nvkm_clk *);
+ 	struct nvkm_pstate *pstates;
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/clk/base.c	2026-10-03 12:48:53.000000000 +0000
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/clk/base.c	2026-10-10 18:02:11.186505401 +0000
+@@ -344,6 +344,25 @@
+ 	return 0;
+ }
+ 
++int
++nvkm_clk_dryrun(struct nvkm_clk *clk, int pstatei, struct nvkm_cstate *out)
++{
++	struct nvkm_pstate *pstate;
++	int idx = 0;
++
++	if (!clk->func->dryrun || !out)
++		return -ENOSYS;
++
++	list_for_each_entry(pstate, &clk->states, head) {
++		if (idx++ == pstatei) {
++			*out = pstate->base;
++			return clk->func->dryrun(clk, out);
++		}
++	}
++
++	return -EINVAL;
++}
++
+ static void
+ nvkm_pstate_info(struct nvkm_clk *clk, struct nvkm_pstate *pstate)
+ {
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/clk/gf100.c	2026-10-03 12:48:53.000000000 +0000
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/clk/gf100.c	2026-10-10 18:12:56.173788357 +0000
+@@ -340,6 +340,22 @@
+ 	return 0;
+ }
+ 
++static int
++gf100_clk_dryrun(struct nvkm_clk *base, struct nvkm_cstate *cstate)
++{
++	/* gf100_clk contains embedded eng[] storage.  The shallow copy shares
++	 * only immutable function/device/VBIOS pointers; gf100_clk_calc() writes
++	 * eng[] in the copy and its helpers perform reads only. */
++	struct gf100_clk shadow = *gf100_clk(base);
++	int ret;
++
++	/* gf100_clk_calc() fills shadow.eng and only reads VBIOS/MMIO state. */
++	ret = gf100_clk_calc(&shadow.base, cstate);
++	if (!ret)
++		cstate->domain[nv_clk_src_gpc] = shadow.eng[0].freq;
++	return ret;
++}
++
+ static void
+ gf100_clk_prog_0(struct gf100_clk *clk, int idx)
+ {
+@@ -449,6 +465,7 @@
+ gf100_clk = {
+ 	.read = gf100_clk_read,
+ 	.calc = gf100_clk_calc,
++	.dryrun = gf100_clk_dryrun,
+ 	.prog = gf100_clk_prog,
+ 	.tidy = gf100_clk_tidy,
+ 	.domains = {
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/clk/pllgt215.c	2026-10-03 12:48:53.000000000 +0000
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/clk/pllgt215.c	2026-10-10 18:39:13.358895780 +0000
+@@ -30,33 +30,62 @@
+ gt215_pll_calc(struct nvkm_subdev *subdev, struct nvbios_pll *info,
+ 	       u32 freq, int *pN, int *pfN, int *pM, int *P)
+ {
+-	u32 best_err = ~0, err;
++	u64 best_err = ~0ULL, err, numerator, quotient, remainder;
++	u64 actual, scaled;
+ 	int M, lM, hM, N, fN;
++	s64 fractional;
++
++	if (!info || !pN || !pM || !P || !freq || !info->refclk ||
++	    !info->vco1.max_freq || !info->vco1.min_inputfreq ||
++	    !info->vco1.max_inputfreq || info->vco1.min_m > info->vco1.max_m ||
++	    !info->vco1.min_m || !info->vco1.min_n ||
++	    info->vco1.min_n > info->vco1.max_n || !info->min_p ||
++	    !info->max_p || info->min_p > info->max_p)
++		return -EINVAL;
+ 
+ 	*P = info->vco1.max_freq / freq;
+ 	if (*P > info->max_p)
+ 		*P = info->max_p;
+ 	if (*P < info->min_p)
+ 		*P = info->min_p;
++	if (!*P)
++		return -ERANGE;
+ 
+-	lM = (info->refclk + info->vco1.max_inputfreq) / info->vco1.max_inputfreq;
+-	lM = max(lM, (int)info->vco1.min_m);
+-	hM = (info->refclk + info->vco1.min_inputfreq) / info->vco1.min_inputfreq;
+-	hM = min(hM, (int)info->vco1.max_m);
++	quotient = ((u64)info->refclk + info->vco1.max_inputfreq) /
++		   info->vco1.max_inputfreq;
++	if (quotient > INT_MAX)
++		return -ERANGE;
++	lM = max((int)quotient, (int)info->vco1.min_m);
++	quotient = ((u64)info->refclk + info->vco1.min_inputfreq) /
++		   info->vco1.min_inputfreq;
++	if (quotient > INT_MAX)
++		return -ERANGE;
++	hM = min((int)quotient, (int)info->vco1.max_m);
+ 	lM = min(lM, hM);
+ 
+ 	for (M = lM; M <= hM; M++) {
+-		u32 tmp = freq * *P * M;
+-		N  = tmp / info->refclk;
+-		fN = tmp % info->refclk;
++		numerator = (u64)freq * *P * M;
++		quotient = div_u64(numerator, info->refclk);
++		remainder = numerator % info->refclk;
++		if (quotient > INT_MAX)
++			return -ERANGE;
++		N = quotient;
+ 
+ 		if (!pfN) {
+-			if (fN >= info->refclk / 2)
++			if (remainder >= info->refclk / 2) {
++				if (N == INT_MAX)
++					return -ERANGE;
+ 				N++;
++			}
+ 		} else {
+-			if (fN <  info->refclk / 2)
++			if (remainder < info->refclk / 2)
+ 				N--;
+-			fN = tmp - (N * info->refclk);
++			/* Preserve the original numerator.  do_div() is deliberately
++			 * avoided here because it overwrites its u64 argument. */
++			fractional = (s64)numerator - ((s64)N * info->refclk);
++			if (fractional < INT_MIN || fractional > INT_MAX)
++				return -ERANGE;
++			fN = fractional;
+ 		}
+ 
+ 		if (N < info->vco1.min_n)
+@@ -64,7 +93,8 @@
+ 		if (N > info->vco1.max_n)
+ 			break;
+ 
+-		err = abs(freq - (info->refclk * N / M / *P));
++		actual = (u64)info->refclk * N / M / *P;
++		err = actual > freq ? actual - freq : freq - actual;
+ 		if (err < best_err) {
+ 			best_err = err;
+ 			*pN = N;
+@@ -72,7 +102,8 @@
+ 		}
+ 
+ 		if (pfN) {
+-			*pfN = ((fN << 13) + info->refclk / 2) / info->refclk;
++			scaled = ((s64)fN << 13) + info->refclk / 2;
++			*pfN = div_u64(scaled, info->refclk);
+ 			*pfN = (*pfN - 4096) & 0xffff;
+ 			return freq;
+ 		}
+@@ -83,5 +114,10 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	return info->refclk * *pN / *pM / *P;
++	if (!*pM || !*P)
++		return -ERANGE;
++	actual = (u64)info->refclk * *pN / *pM / *P;
++	if (actual > INT_MAX)
++		return -ERANGE;
++	return actual;
+ }
+--- a/drivers/gpu/drm/nouveau/include/nvkm/subdev/fb.h	2026-10-03 12:48:53.000000000 +0000
++++ b/drivers/gpu/drm/nouveau/include/nvkm/subdev/fb.h	2026-10-10 18:09:14.355626266 +0000
+@@ -115,6 +115,17 @@
+ 	u32 freq;
+ };
+ 
++/* Read-only result from a RAM/VBIOS transition calculation. */
++struct nvkm_ram_dryrun {
++	u32 requested_khz;
++	u32 rounded_khz;
++	u32 ref_khz;
++	u8 rammap_ver;
++	u8 ramcfg_strap;
++	u8 timing_ver;
++	bool timing_present;
++};
++
+ enum nvkm_ram_type {
+ 	NVKM_RAM_TYPE_UNKNOWN = 0,
+ 	NVKM_RAM_TYPE_STOLEN,
+@@ -176,6 +187,7 @@
+ 	int (*init)(struct nvkm_ram *);
+ 
+ 	int (*calc)(struct nvkm_ram *, u32 freq);
++	int (*dryrun)(struct nvkm_ram *, u32 freq, struct nvkm_ram_dryrun *);
+ 	int (*prog)(struct nvkm_ram *);
+ 	void (*tidy)(struct nvkm_ram *);
+ };
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/fb/ram.h	2026-10-03 12:48:53.000000000 +0000
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/fb/ram.h	2026-10-10 18:09:20.515361726 +0000
+@@ -9,6 +9,7 @@
+ 		   enum nvkm_ram_type, u64 size, struct nvkm_ram **);
+ void nvkm_ram_del(struct nvkm_ram **);
+ int  nvkm_ram_init(struct nvkm_ram *);
++int  nvkm_ram_dryrun(struct nvkm_ram *, u32, struct nvkm_ram_dryrun *);
+ 
+ extern const struct nvkm_ram_func nv04_ram_func;
+ 
+@@ -26,6 +27,7 @@
+ u32  gf100_ram_probe_fbpa_amount(struct nvkm_device *, int);
+ int gf100_ram_init(struct nvkm_ram *);
+ int gf100_ram_calc(struct nvkm_ram *, u32);
++int gf100_ram_dryrun(struct nvkm_ram *, u32, struct nvkm_ram_dryrun *);
+ int gf100_ram_prog(struct nvkm_ram *);
+ void gf100_ram_tidy(struct nvkm_ram *);
+ 
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/fb/ram.c	2026-10-03 12:48:53.000000000 +0000
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/fb/ram.c	2026-10-10 18:09:22.863260903 +0000
+@@ -199,6 +199,14 @@
+ 	return 0;
+ }
+ 
++int
++nvkm_ram_dryrun(struct nvkm_ram *ram, u32 freq, struct nvkm_ram_dryrun *out)
++{
++	if (!ram || !out || !ram->func->dryrun)
++		return -ENOSYS;
++	return ram->func->dryrun(ram, freq, out);
++}
++
+ void
+ nvkm_ram_del(struct nvkm_ram **pram)
+ {
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/fb/ramgf100.c	2026-10-03 12:48:53.000000000 +0000
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/fb/ramgf100.c	2026-10-10 18:16:49.187231362 +0000
+@@ -404,6 +404,78 @@
+ }
+ 
+ int
++gf100_ram_dryrun(struct nvkm_ram *base, u32 freq,
++		 struct nvkm_ram_dryrun *out)
++{
++	struct gf100_ram *ram = gf100_ram(base);
++	struct nvkm_subdev *subdev = &ram->base.fb->subdev;
++	struct nvkm_device *device = subdev->device;
++	struct nvkm_bios *bios = device->bios;
++	struct nvkm_clk *clk = device->clk;
++	struct nvbios_ramcfg cfg;
++	u8 ver, cnt, len, strap;
++	struct { u32 data; u8 size; } rammap, ramcfg, timing;
++	int ref;
++	u32 div, out_freq;
++	u64 doubled_ref, quotient;
++
++	if (!out || !freq)
++		return -EINVAL;
++	memset(out, 0, sizeof(*out));
++	out->requested_khz = freq;
++
++	/* This is the lookup portion of gf100_ram_calc(), deliberately stopping
++	 * before ram_init(), RAMFUC construction, PLL programming or any writes. */
++	rammap.data = nvbios_rammapEm(bios, freq / 1000, &ver, &rammap.size,
++				      &cnt, &ramcfg.size, &cfg);
++	if (!rammap.data || ver != 0x10 || rammap.size < 0x0e)
++		return -EINVAL;
++	out->rammap_ver = ver;
++
++	strap = nvbios_ramcfg_index(subdev);
++	if (strap >= cnt)
++		return -EINVAL;
++	out->ramcfg_strap = strap;
++	ramcfg.data = rammap.data + rammap.size + (strap * ramcfg.size);
++	if (!ramcfg.data || ramcfg.size < 0x0e)
++		return -EINVAL;
++
++	strap = nvbios_rd08(bios, ramcfg.data + 0x01);
++	if (strap != 0xff) {
++		timing.data = nvbios_timingEe(bios, strap, &ver, &timing.size,
++					      &cnt, &len);
++		if (!timing.data || ver != 0x10 || timing.size < 0x19)
++			return -EINVAL;
++		out->timing_present = true;
++		out->timing_ver = ver;
++	}
++
++	if (!clk)
++		return -ENODEV;
++	if (!(nvkm_rd32(device, 0x137300) & 0x00000100))
++		ref = nvkm_clk_read(clk, nv_clk_src_sppll0);
++	else
++		ref = nvkm_clk_read(clk, nv_clk_src_sppll1);
++	if (ref <= 0)
++		return ref ? ref : -ERANGE;
++	/* Keep the arithmetic wide: ref is an int from nvkm_clk_read(), while
++	 * freq is u32.  The original programming path assumes normal MHz values;
++	 * the dry-run must reject pathological input instead of overflowing. */
++	doubled_ref = (u64)(u32)ref * 2;
++	quotient = doubled_ref / freq;
++	quotient = min(quotient, (u64)65);
++	quotient = max(quotient, (u64)2);
++	div = (u32)quotient - 2;
++	quotient = doubled_ref / (div + 2);
++	if (quotient > U32_MAX)
++		return -ERANGE;
++	out_freq = (u32)quotient;
++	out->ref_khz = ref;
++	out->rounded_khz = out_freq;
++	return 0;
++}
++
++int
+ gf100_ram_prog(struct nvkm_ram *base)
+ {
+ 	struct gf100_ram *ram = gf100_ram(base);
+@@ -661,6 +733,7 @@
+ 	.probe_fbpa_amount = gf100_ram_probe_fbpa_amount,
+ 	.init = gf100_ram_init,
+ 	.calc = gf100_ram_calc,
++	.dryrun = gf100_ram_dryrun,
+ 	.prog = gf100_ram_prog,
+ 	.tidy = gf100_ram_tidy,
+ };
+--- a/drivers/gpu/drm/nouveau/nouveau_debugfs.c	2026-10-10 18:05:30.248808330 +0000
++++ b/drivers/gpu/drm/nouveau/nouveau_debugfs.c	2026-10-10 18:11:16.778234741 +0000
+@@ -31,6 +31,7 @@
+ #include <linux/debugfs.h>
+ #include <nvif/class.h>
+ #include <nvif/if0001.h>
++#include <subdev/fb/ram.h>
+ #include "nouveau_debugfs.h"
+ #include "nouveau_drv.h"
+ 
+@@ -179,6 +180,70 @@
+ 	.release = single_release,
+ };
+ 
++static int
++nouveau_debugfs_pstate_plan_get(struct seq_file *m, void *data)
++{
++	struct drm_device *drm = m->private;
++	struct nouveau_drm *ndrm = nouveau_drm(drm);
++	struct nvkm_clk *clk = nvxx_clk(ndrm);
++	struct nvkm_fb *fb = nvxx_fb(ndrm);
++	struct nvkm_pstate *pstate;
++	int i = 0;
++
++	if (!clk)
++		return -ENODEV;
++
++	seq_printf(m, "allow_reclock=%u states=%d current=%d\n",
++		   clk->allow_reclock, clk->state_nr, clk->pstate);
++	list_for_each_entry(pstate, &clk->states, head) {
++		struct nvkm_cstate cstate;
++		struct nvkm_ram_dryrun ram;
++		u32 requested_core = pstate->base.domain[nv_clk_src_gpc];
++		u32 requested_memory = pstate->base.domain[nv_clk_src_mem];
++		int state = i++;
++		int ret = nvkm_clk_dryrun(clk, state, &cstate);
++		int ram_ret;
++
++		if (ret) {
++			seq_printf(m, "state=%d dryrun_error=%d\n", state, ret);
++			continue;
++		}
++
++		ram_ret = fb && fb->ram ? nvkm_ram_dryrun(fb->ram, requested_memory,
++							 &ram) : -ENODEV;
++		seq_printf(m, "state=%d id=%u voltage=%u requested_core=%u "
++			   "calculated_core=%u requested_memory=%u\n", state, cstate.id,
++			   cstate.voltage,
++			   requested_core,
++			   cstate.domain[nv_clk_src_gpc],
++			   requested_memory);
++		if (ram_ret)
++			seq_printf(m, "state=%d ram_dryrun_error=%d\n", state, ram_ret);
++		else
++			seq_printf(m, "state=%d rammap_ver=%u strap=%u timing_ver=%u "
++				   "timing_present=%u ref_khz=%u rounded_memory=%u\n",
++				   state, ram.rammap_ver, ram.ramcfg_strap,
++				   ram.timing_ver, ram.timing_present, ram.ref_khz,
++				   ram.rounded_khz);
++	}
++	return 0;
++}
++
++static int
++nouveau_debugfs_pstate_plan_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, nouveau_debugfs_pstate_plan_get,
++			   inode->i_private);
++}
++
++static const struct file_operations nouveau_pstate_plan_fops = {
++	.owner = THIS_MODULE,
++	.open = nouveau_debugfs_pstate_plan_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
+ static ssize_t
+ nouveau_debugfs_pstate_set(struct file *file, const char __user *ubuf,
+ 			   size_t len, loff_t *offp)
+@@ -303,6 +368,7 @@
+ } nouveau_debugfs_files[] = {
+ 	{"pstate", &nouveau_pstate_fops},
+ 	{"pstate_current", &nouveau_pstate_current_fops},
++	{"pstate_plan", &nouveau_pstate_plan_fops},
+ };
+ 
+ void

@@ -1,0 +1,25 @@
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/clk/gf100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/clk/gf100.c
+@@ -25,6 +25,7 @@
+ #include "priv.h"
+ #include "pll.h"
+ 
++#include <core/option.h>
+ #include <subdev/bios.h>
+ #include <subdev/bios/pll.h>
+ #include <subdev/timer.h>
+@@ -472,10 +473,13 @@ gf100_clk_new(struct nvkm_device *device, enum nvkm_subdev_type type, int inst,
+ 	      struct nvkm_clk **pclk)
+ {
+ 	struct gf100_clk *clk;
++	bool allow_reclock = device->chipset == 0x117 &&
++		nvkm_boolopt(device->cfgopt, "NvReclockFermi", false);
+ 
+ 	if (!(clk = kzalloc_obj(*clk)))
+ 		return -ENOMEM;
+ 	*pclk = &clk->base;
+ 
+-	return nvkm_clk_ctor(&gf100_clk, device, type, inst, false, &clk->base);
++	return nvkm_clk_ctor(&gf100_clk, device, type, inst, allow_reclock,
++			     &clk->base);
+ }

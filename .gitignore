@@ -1,0 +1,4 @@
+work/
+ci-output/
+__pycache__/
+*.ko

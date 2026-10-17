@@ -1,0 +1,276 @@
+From: Codex <noreply@openai.com>
+Subject: [PATCH] nouveau: add opt-in GF117 engine-only reclock experiment
+
+NvReclockFermiCoreOnly is off by default and only affects chipset 0xd7.
+Use VBIOS engine clocks and voltage, leaving PCIe and memory programming out
+of the transition. Require readable voltage and memory clocks, preflight the
+engine calculation, propagate PLL timeouts and verify final clock readback.
+Never lower voltage/cooling in this mode; mark pstate unknown on failure.
+
+This is an unvalidated hardware experiment, not GF117 memory-reclock support.
+No module installation or clock programming is required to build this patch.
+
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/clk/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/clk/base.c
+@@ -35,6 +35,16 @@
+ 
+ #include <core/option.h>
+ 
++/* Explicit experimental mode: preserve memory's boot clock. */
++static bool
++nvkm_clk_fermi_core_only(struct nvkm_clk *clk)
++{
++	struct nvkm_device *device = clk->subdev.device;
++
++	return device->chipset == 0xd7 &&
++		nvkm_boolopt(device->cfgopt, "NvReclockFermiCoreOnly", false);
++}
++
+ /******************************************************************************
+  * misc
+  *****************************************************************************/
+@@ -165,9 +175,10 @@
+ 	struct nvkm_therm *therm = device->therm;
+ 	struct nvkm_volt *volt = device->volt;
+ 	struct nvkm_cstate *cstate;
+-	int ret;
+-
+-	if (!list_empty(&pstate->list)) {
++	bool core_only = nvkm_clk_fermi_core_only(clk);
++	int ret, target_uv = 0;
++
++	if (!core_only && !list_empty(&pstate->list)) {
+ 		cstate = nvkm_cstate_get(clk, pstate, cstatei);
+ 		cstate = nvkm_cstate_find_best(clk, pstate, cstate);
+ 		if (!cstate)
+@@ -176,6 +187,15 @@
+ 		cstate = &pstate->base;
+ 	}
+ 
++	if (core_only) {
++		/* A missing/unreadable regulator must not be treated as success. */
++		if (!volt || nvkm_volt_get(volt) <= 0)
++			return -ENODEV;
++		target_uv = nvkm_volt_map(volt, cstate->voltage, clk->temp);
++		if (target_uv <= 0)
++			return target_uv ? target_uv : -ERANGE;
++	}
++
+ 	if (therm) {
+ 		ret = nvkm_therm_cstate(therm, pstate->fanspeed, +1);
+ 		if (ret && ret != -ENODEV) {
+@@ -187,17 +207,25 @@
+ 	if (volt) {
+ 		ret = nvkm_volt_set_id(volt, cstate->voltage,
+ 				       pstate->base.voltage, clk->temp, +1);
+-		if (ret && ret != -ENODEV) {
++		if (ret && (core_only || ret != -ENODEV)) {
+ 			nvkm_error(subdev, "failed to raise voltage: %d\n", ret);
+ 			return ret;
+ 		}
+ 	}
++
++	if (core_only && nvkm_volt_get(volt) < target_uv)
++		return -ERANGE;
+ 
+ 	ret = clk->func->calc(clk, cstate);
+ 	if (ret == 0) {
+ 		ret = clk->func->prog(clk);
+ 		clk->func->tidy(clk);
+ 	}
++
++	/* Core-only mode never lowers boot voltage or cooling. In particular,
++	 * keep voltage raised if a PLL switch fails; physical state is unknown. */
++	if (core_only)
++		return ret;
+ 
+ 	if (volt) {
+ 		int err = nvkm_volt_set_id(volt, cstate->voltage,
+@@ -278,6 +306,37 @@
+ 	list_for_each_entry(pstate, &clk->states, head) {
+ 		if (idx++ == pstatei)
+ 			break;
++	}
++
++	if (nvkm_clk_fermi_core_only(clk)) {
++		struct nvkm_cstate plan;
++		int memory_before, memory_after, core_after;
++
++		/* Use the VBIOS state and existing core/voltage path only. No PCIe,
++		 * RAMFUC, memory PLL, memory timing or synthetic pstate writes. */
++		memory_before = nvkm_clk_read(clk, nv_clk_src_mem);
++		if (memory_before <= 0)
++			return -ENODEV;
++		ret = nvkm_clk_dryrun(clk, pstatei, &plan);
++		if (ret)
++			return ret;
++		if (!plan.domain[nv_clk_src_gpc])
++			return -ERANGE;
++		ret = nvkm_cstate_prog(clk, pstate, NVKM_CLK_CSTATE_HIGHEST);
++		if (ret) {
++			clk->pstate = -1;
++			return ret;
++		}
++		memory_after = nvkm_clk_read(clk, nv_clk_src_mem);
++		core_after = nvkm_clk_read(clk, nv_clk_src_gpc);
++		if (memory_after != memory_before || core_after <= 0 ||
++		    abs((s64)core_after - plan.domain[nv_clk_src_gpc]) >
++			plan.domain[nv_clk_src_gpc] / 100) {
++			clk->pstate = -1;
++			return -EIO;
++		}
++		clk->pstate = pstatei;
++		return 0;
+ 	}
+ 
+ 	/* The experimental GF117 opt-in must not continue to core/voltage
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/clk/gf100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/clk/gf100.c
+@@ -92,6 +92,10 @@
+ 		return 0;
+ 	}
+ 
++	/* Failed MMIO/PLL readback must not divide by zero on the GF117
++	 * experimental path. Crystal PLLs above have already forced P = 1. */
++	if (device->chipset == 0xd7 && (!M || !P))
++		return 0;
+ 	return sclk * N / M / P;
+ }
+ 
+@@ -357,7 +361,7 @@
+ 	return ret;
+ }
+ 
+-static void
++static int
+ gf100_clk_prog_0(struct gf100_clk *clk, int idx)
+ {
+ 	struct gf100_clk_info *info = &clk->eng[idx];
+@@ -366,20 +370,24 @@
+ 		nvkm_mask(device, 0x1371d0 + (idx * 0x04), 0x80003f3f, info->ddiv);
+ 		nvkm_wr32(device, 0x137160 + (idx * 0x04), info->dsrc);
+ 	}
+-}
+-
+-static void
++	return 0;
++}
++
++static int
+ gf100_clk_prog_1(struct gf100_clk *clk, int idx)
+ {
+ 	struct nvkm_device *device = clk->base.subdev.device;
+ 	nvkm_mask(device, 0x137100, (1 << idx), 0x00000000);
+-	nvkm_msec(device, 2000,
++	if (nvkm_msec(device, 2000,
+ 		if (!(nvkm_rd32(device, 0x137100) & (1 << idx)))
+ 			break;
+-	);
+-}
+-
+-static void
++	) < 0 && device->chipset == 0xd7 &&
++	    nvkm_boolopt(device->cfgopt, "NvReclockFermiCoreOnly", false))
++		return -ETIMEDOUT;
++	return 0;
++}
++
++static int
+ gf100_clk_prog_2(struct gf100_clk *clk, int idx)
+ {
+ 	struct gf100_clk_info *info = &clk->eng[idx];
+@@ -394,39 +402,46 @@
+ 
+ 			/* Test PLL lock */
+ 			nvkm_mask(device, addr + 0x00, 0x00000010, 0x00000000);
+-			nvkm_msec(device, 2000,
++			if (nvkm_msec(device, 2000,
+ 				if (nvkm_rd32(device, addr + 0x00) & 0x00020000)
+ 					break;
+-			);
++			) < 0 && device->chipset == 0xd7 &&
++			    nvkm_boolopt(device->cfgopt, "NvReclockFermiCoreOnly", false))
++				return -ETIMEDOUT;
+ 			nvkm_mask(device, addr + 0x00, 0x00000010, 0x00000010);
+ 
+ 			/* Enable sync mode */
+ 			nvkm_mask(device, addr + 0x00, 0x00000004, 0x00000004);
+ 		}
+ 	}
+-}
+-
+-static void
++	return 0;
++}
++
++static int
+ gf100_clk_prog_3(struct gf100_clk *clk, int idx)
+ {
+ 	struct gf100_clk_info *info = &clk->eng[idx];
+ 	struct nvkm_device *device = clk->base.subdev.device;
+ 	if (info->ssel) {
+ 		nvkm_mask(device, 0x137100, (1 << idx), info->ssel);
+-		nvkm_msec(device, 2000,
++		if (nvkm_msec(device, 2000,
+ 			u32 tmp = nvkm_rd32(device, 0x137100) & (1 << idx);
+ 			if (tmp == info->ssel)
+ 				break;
+-		);
+-	}
+-}
+-
+-static void
++		) < 0 && device->chipset == 0xd7 &&
++		    nvkm_boolopt(device->cfgopt, "NvReclockFermiCoreOnly", false))
++			return -ETIMEDOUT;
++	}
++	return 0;
++}
++
++static int
+ gf100_clk_prog_4(struct gf100_clk *clk, int idx)
+ {
+ 	struct gf100_clk_info *info = &clk->eng[idx];
+ 	struct nvkm_device *device = clk->base.subdev.device;
+ 	nvkm_mask(device, 0x137250 + (idx * 0x04), 0x00003f3f, info->mdiv);
++	return 0;
+ }
+ 
+ static int
+@@ -434,7 +449,7 @@
+ {
+ 	struct gf100_clk *clk = gf100_clk(base);
+ 	struct {
+-		void (*exec)(struct gf100_clk *, int);
++		int (*exec)(struct gf100_clk *, int);
+ 	} stage[] = {
+ 		{ gf100_clk_prog_0 }, /* div programming */
+ 		{ gf100_clk_prog_1 }, /* select div mode */
+@@ -442,13 +457,15 @@
+ 		{ gf100_clk_prog_3 }, /* (maybe) select pll mode */
+ 		{ gf100_clk_prog_4 }, /* final divider */
+ 	};
+-	int i, j;
++	int i, j, ret;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(stage); i++) {
+ 		for (j = 0; j < ARRAY_SIZE(clk->eng); j++) {
+ 			if (!clk->eng[j].freq)
+ 				continue;
+-			stage[i].exec(clk, j);
++			ret = stage[i].exec(clk, j);
++			if (ret)
++				return ret;
+ 		}
+ 	}
+ 
+@@ -491,7 +508,8 @@
+ {
+ 	struct gf100_clk *clk;
+ 	bool allow_reclock = device->chipset == 0xd7 &&
+-		nvkm_boolopt(device->cfgopt, "NvReclockFermi", false);
++		(nvkm_boolopt(device->cfgopt, "NvReclockFermi", false) ||
++		 nvkm_boolopt(device->cfgopt, "NvReclockFermiCoreOnly", false));
+ 
+ 	if (!(clk = kzalloc_obj(*clk)))
+ 		return -ENOMEM;

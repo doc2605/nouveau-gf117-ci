@@ -1,0 +1,31 @@
+From: Codex <noreply@openai.com>
+Subject: [PATCH] nouveau: avoid legacy VGA CRTC locking on headless GF117
+
+GF117 has no display heads. Generic devinit preinit/dtor call lockvgac,
+whose initial rdvgac writes CRTC index 0x1f to 0x6013d4. The notebook's
+stock driver reports a PRIVRING fault at that address during both load
+and removal. Avoid all accesses in this lock helper on chipset 0xd7.
+Keep the behavior on other Fermi, Kepler and legacy chips unchanged.
+
+Hardware reference: envytools/docs/hw/gpu.rst (GF117, HEADs column).
+This source correction still requires physical validation on the notebook.
+
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/vga.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/vga.c
+@@ -127,8 +127,15 @@
+ bool
+ nvkm_lockvgac(struct nvkm_device *device, bool lock)
+ {
+-	bool locked = !nvkm_rdvgac(device, 0, 0x1f);
++	bool locked;
+ 	u8 data = lock ? 0x99 : 0x57;
++
++	/* GF117 is a render-only Optimus GPU without display heads. Legacy
++	 * VGA CRTC accesses fault, including the index write in rdvgac(). */
++	if (device->chipset == 0xd7)
++		return false;
++
++	locked = !nvkm_rdvgac(device, 0, 0x1f);
+ 	if (device->card_type < NV_50)
+ 		nvkm_wrvgac(device, 0, 0x1f, data);
+ 	else

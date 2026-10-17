@@ -1,0 +1,202 @@
+From: Codex <noreply@openai.com>
+Subject: [PATCH] nouveau: inspect GF117 RAM tables and reject incomplete transitions
+
+Parse RAMMAP 0x11 / timing 0x20 in the read-only plan using their own
+sizes and timing-index offsets. Report the selected entry and failure stage.
+Do not enable the hardcoded GF100 RAMFUC sequence for these tables.
+
+Correct GF117's internal chipset ID (0xd7) and preflight its RAM path before
+pstate, PCIe, core or voltage programming. Legacy pstate programming ignores
+RAM calculation failures and would otherwise continue with core programming.
+Initialize the diagnostic result even when the RAM callback is unavailable.
+
+--- a/drivers/gpu/drm/nouveau/include/nvkm/subdev/fb.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/subdev/fb.h
+@@ -123,7 +123,9 @@
+ 	u8 rammap_ver;
+ 	u8 ramcfg_strap;
+ 	u8 timing_ver;
++	u8 timing_index;
+ 	bool timing_present;
++	const char *failure_stage;
+ };
+ 
+ enum nvkm_ram_type {
+--- a/drivers/gpu/drm/nouveau/nouveau_debugfs.c
++++ b/drivers/gpu/drm/nouveau/nouveau_debugfs.c
+@@ -197,7 +197,7 @@
+ 		   clk->allow_reclock, clk->state_nr, clk->pstate);
+ 	list_for_each_entry(pstate, &clk->states, head) {
+ 		struct nvkm_cstate cstate;
+-		struct nvkm_ram_dryrun ram;
++		struct nvkm_ram_dryrun ram = {};
+ 		/* GF100's core domain is represented at 2x the physical GPC clock. */
+ 		u32 requested_core_khz =
+ 			pstate->base.domain[nv_clk_src_gpc] / 2;
+@@ -220,8 +220,13 @@
+ 			   cstate.domain[nv_clk_src_gpc] / 2,
+ 			   requested_memory);
+ 		if (ram_ret)
+-			seq_printf(m, "state=%d ram_dryrun_error=%d rammap_ver=%u\n",
+-				   state, ram_ret, ram.rammap_ver);
++			seq_printf(m, "state=%d ram_dryrun_error=%d stage=%s "
++				   "rammap_ver=%u strap=%u timing_index=%u "
++				   "timing_ver=%u timing_present=%u\n",
++				   state, ram_ret,
++				   ram.failure_stage ?: "unavailable",
++				   ram.rammap_ver, ram.ramcfg_strap, ram.timing_index,
++				   ram.timing_ver, ram.timing_present);
+ 		else
+ 			seq_printf(m, "state=%d rammap_ver=%u strap=%u timing_ver=%u "
+ 				   "timing_present=%u ref_khz=%u rounded_memory=%u\n",
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/clk/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/clk/base.c
+@@ -29,6 +29,7 @@
+ #include <subdev/bios/perf.h>
+ #include <subdev/bios/vpstate.h>
+ #include <subdev/fb.h>
++#include <subdev/fb/ram.h>
+ #include <subdev/therm.h>
+ #include <subdev/volt.h>
+ 
+@@ -279,8 +280,26 @@
+ 			break;
+ 	}
+ 
++	/* The experimental GF117 opt-in must not continue to core/voltage
++	 * programming when memory cannot transition. The legacy path below
++	 * does not propagate RAM calculation failures to nvkm_cstate_prog(). */
++	if (subdev->device->chipset == 0xd7) {
++		struct nvkm_ram_dryrun plan = {};
++
++		if (!fb || !fb->ram)
++			return -ENODEV;
++		ret = nvkm_ram_dryrun(fb->ram,
++				     pstate->base.domain[nv_clk_src_mem], &plan);
++		if (ret) {
++			nvkm_error(subdev, "GF117 reclock preflight: %s (%d)\n",
++				   plan.failure_stage ?: "unavailable", ret);
++			return ret;
++		}
++	}
++
+ 	nvkm_debug(subdev, "setting performance state %d\n", pstatei);
+-	clk->pstate = pstatei;
++	if (subdev->device->chipset != 0xd7)
++		clk->pstate = pstatei;
+ 
+ 	nvkm_pcie_set_link(pci, pstate->pcie_speed, pstate->pcie_width);
+ 
+@@ -293,9 +312,14 @@
+ 				ret = ram->func->prog(ram);
+ 		} while (ret > 0);
+ 		ram->func->tidy(ram);
+-	}
+-
+-	return nvkm_cstate_prog(clk, pstate, NVKM_CLK_CSTATE_HIGHEST);
++		if (ret < 0 && subdev->device->chipset == 0xd7)
++			return ret;
++	}
++
++	ret = nvkm_cstate_prog(clk, pstate, NVKM_CLK_CSTATE_HIGHEST);
++	if (!ret && subdev->device->chipset == 0xd7)
++		clk->pstate = pstatei;
++	return ret;
+ }
+ 
+ static void
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/clk/gf100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/clk/gf100.c
+@@ -490,7 +490,7 @@
+ 	      struct nvkm_clk **pclk)
+ {
+ 	struct gf100_clk *clk;
+-	bool allow_reclock = device->chipset == 0x117 &&
++	bool allow_reclock = device->chipset == 0xd7 &&
+ 		nvkm_boolopt(device->cfgopt, "NvReclockFermi", false);
+ 
+ 	if (!(clk = kzalloc_obj(*clk)))
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/fb/ramgf100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/fb/ramgf100.c
+@@ -413,7 +413,7 @@
+ 	struct nvkm_bios *bios = device->bios;
+ 	struct nvkm_clk *clk = device->clk;
+ 	struct nvbios_ramcfg cfg;
+-	u8 ver, cnt, len, strap;
++	u8 ver = 0, cnt, len, strap;
+ 	struct { u32 data; u8 size; } rammap, ramcfg, timing;
+ 	int ref;
+ 	u32 div, out_freq;
+@@ -424,35 +424,50 @@
+ 	memset(out, 0, sizeof(*out));
+ 	out->requested_khz = freq;
+ 
+-	/* This is the lookup portion of gf100_ram_calc(), deliberately stopping
+-	 * before ram_init(), RAMFUC construction, PLL programming or any writes. */
++	/* Inspect both table layouts without constructing or executing RAMFUC.
++	 * Parsing 0x11 does not make the legacy GF100 write sequence valid. */
++	out->failure_stage = "rammap";
+ 	rammap.data = nvbios_rammapEm(bios, freq / 1000, &ver, &rammap.size,
+ 				      &cnt, &ramcfg.size, &cfg);
++	out->rammap_ver = ver;
+ 	if (!rammap.data)
+ 		return -EINVAL;
+-	out->rammap_ver = ver;
+-	if (ver != 0x10)
++	if (ver != 0x10 && ver != 0x11)
+ 		return -EOPNOTSUPP;
+-	if (rammap.size < 0x0e)
++	if (rammap.size < (ver == 0x10 ? 0x0e : 0x12))
+ 		return -EINVAL;
+ 
++	out->failure_stage = "ramcfg";
+ 	strap = nvbios_ramcfg_index(subdev);
+-	if (strap >= cnt)
++	out->ramcfg_strap = strap;
++	if (strap >= cnt || ramcfg.size < (ver == 0x10 ? 0x0e : 0x0a))
+ 		return -EINVAL;
+-	out->ramcfg_strap = strap;
+ 	ramcfg.data = rammap.data + rammap.size + (strap * ramcfg.size);
+-	if (!ramcfg.data || ramcfg.size < 0x0e)
+-		return -EINVAL;
+-
+-	strap = nvbios_rd08(bios, ramcfg.data + 0x01);
++	/* RAMCFG 0x11 moves the timing index to byte zero. */
++	strap = nvbios_rd08(bios, ramcfg.data + (ver == 0x10 ? 1 : 0));
++	out->timing_index = strap;
+ 	if (strap != 0xff) {
++		out->failure_stage = "timing";
+ 		timing.data = nvbios_timingEe(bios, strap, &ver, &timing.size,
+ 					      &cnt, &len);
+-		if (!timing.data || ver != 0x10 || timing.size < 0x19)
++		out->timing_ver = ver;
++		if (!timing.data)
++			return -EINVAL;
++		if (ver != 0x10 && ver != 0x20)
++			return -EOPNOTSUPP;
++		if (timing.size < (ver == 0x10 ? 0x19 : 0x33))
+ 			return -EINVAL;
+ 		out->timing_present = true;
+-		out->timing_ver = ver;
+-	}
++	}
++
++	/* gf100_ram_calc still uses hardcoded training and timing values. Never
++	 * report a programmable plan for the newer table pair on GF117. */
++	if (out->rammap_ver != 0x10 ||
++	    (out->timing_present && out->timing_ver != 0x10)) {
++		out->failure_stage = "ram-sequence-unimplemented";
++		return -EOPNOTSUPP;
++	}
++	out->failure_stage = "reference-clock";
+ 
+ 	if (!clk)
+ 		return -ENODEV;
+@@ -476,6 +491,7 @@
+ 	out_freq = (u32)quotient;
+ 	out->ref_khz = ref;
+ 	out->rounded_khz = out_freq;
++	out->failure_stage = NULL;
+ 	return 0;
+ }
+ 

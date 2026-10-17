@@ -1,0 +1,46 @@
+Subject: [PATCH] Expose read-only GF117 voltage prerequisites before clock request
+
+--- a/drivers/gpu/drm/nouveau/nouveau_debugfs.c
++++ b/drivers/gpu/drm/nouveau/nouveau_debugfs.c
+@@ -32,6 +32,7 @@
+ #include <nvif/class.h>
+ #include <nvif/if0001.h>
+ #include <subdev/fb/ram.h>
++#include <subdev/volt.h>
+ #include "nouveau_debugfs.h"
+ #include "nouveau_drv.h"
+ 
+@@ -205,6 +206,8 @@
+ 		int state = i++;
+ 		int ret = nvkm_clk_dryrun(clk, state, &cstate);
+ 		int ram_ret;
++		struct nvkm_volt *volt = nvxx_volt(ndrm);
++		int voltage_uv, target_uv, voltage_ready = 0, vid;
+ 
+ 		if (ret) {
+ 			seq_printf(m, "state=%d dryrun_error=%d\n", state, ret);
+@@ -219,6 +222,24 @@
+ 			   requested_core_khz,
+ 			   cstate.domain[nv_clk_src_gpc] / 2,
+ 			   requested_memory);
++		if (nvxx_device(ndrm)->chipset == 0xd7) {
++			/* Read-only regulator preflight; no VID writes here. GF117 uses GPIO VIDs. */
++			voltage_uv = volt ? nvkm_volt_get(volt) : -ENODEV;
++			target_uv = volt ? nvkm_volt_map(volt, pstate->base.voltage,
++							 clk->temp) : -ENODEV;
++			if (voltage_uv > 0 && target_uv > 0) {
++				voltage_ready = voltage_uv >= target_uv;
++				for (vid = 0; vid < volt->vid_nr; vid++) {
++					if (volt->vid[vid].uv >= target_uv &&
++					    volt->vid[vid].uv <= volt->max_uv)
++						voltage_ready = 1;
++				}
++			}
++			seq_printf(m, "state=%d voltage_uv=%d target_uv=%d voltage_ready=%d "
++				   "voltage_temp_c=%u\n", state, voltage_uv, target_uv,
++				   voltage_ready, clk->temp);
++		}
++
+ 		if (ram_ret)
+ 			seq_printf(m, "state=%d ram_dryrun_error=%d stage=%s "
+ 				   "rammap_ver=%u strap=%u timing_index=%u "
