@@ -17,4 +17,6 @@ The archive has only distro kernel build inputs. Proprietary driver files,
 VBIOS dumps, notebook logs and local build outputs are not CI inputs.
 
 Public CI: https://github.com/doc2605/nouveau-gf117-ci
-Verified successful run: https://github.com/doc2605/nouveau-gf117-ci/actions/runs/38990375809
+Verified successful run with patches 0001-0013:
+https://github.com/doc2605/nouveau-gf117-ci/actions/runs/38993610060
+Compiled commit: d6cfd3bdb4df61581a2ce024ad638d50ee6b7602.
