@@ -11,8 +11,8 @@ case "${1:-}" in
     *) echo "Argumento inválido; use --help" >&2; exit 2 ;;
 esac
 [[ $EUID == 0 ]] || { echo "Execute com sudo." >&2; exit 2; }
-module=/home/doc/Nvidia-GT720M-Fix-atualizado/artifacts/github-actions/38993610060/gf117-nouveau-d6cfd3bdb4df61581a2ce024ad638d50ee6b7602/nouveau.ko
-expected_hash=be2bda85d428b77ffe016d4af493fa30f64c4e5cb9f1216c52f4fff4faf972af
+module=/home/doc/Nvidia-GT720M-Fix-atualizado/artifacts/github-actions/38995174454/gf117-nouveau-26bc95aa63553402040d6d99535eff522485d0e6/nouveau.ko
+expected_hash=cf64016ead38e01c70c23cbec966b53a2a6df9ea3cf9dcaf8a2264fcf23c2490
 device=/sys/bus/pci/devices/0000:08:00.0
 debugfs=/sys/kernel/debug/dri/0000:08:00.0
 hwmon_root=/sys/class/hwmon
