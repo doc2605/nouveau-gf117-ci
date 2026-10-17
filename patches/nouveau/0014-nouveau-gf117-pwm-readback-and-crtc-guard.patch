@@ -1,0 +1,136 @@
+Subject: [PATCH] Read GF117 VBIOS PWM voltage and block absent legacy CRTC
+
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/volt/gf117.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/volt/gf117.c
+@@ -23,7 +23,33 @@
+  */
+ #include "priv.h"
+ 
++#include <subdev/bios.h>
++#include <subdev/bios/volt.h>
+ #include <subdev/fuse.h>
++#include <subdev/gpio.h>
++
++struct gf117_volt {
++	struct nvkm_volt base;
++	struct nvbios_volt bios;
++};
++
++static int
++gf117_volt_pwm_get(struct nvkm_volt *base)
++{
++	struct gf117_volt *volt = container_of(base, struct gf117_volt, base);
++	struct nvkm_device *device = base->subdev.device;
++	u32 div = nvkm_rd32(device, 0x20340);
++	u32 duty = nvkm_rd32(device, 0x20344) & 0x7fffffff;
++	u64 uv;
++
++	/* This mode is read-only until GF117 PWM programming is validated. */
++	if (!div || duty > div)
++		return -ERANGE;
++	uv = volt->bios.base + div64_u64((u64)volt->bios.pwm_range * duty, div);
++	if (uv < base->min_uv || uv > base->max_uv || uv > INT_MAX)
++		return -ERANGE;
++	return (int)uv;
++}
+ 
+ static int
+ gf117_volt_speedo_read(struct nvkm_volt *volt)
+@@ -37,11 +63,14 @@
+ 	return nvkm_fuse_read(fuse, 0x3a8);
+ }
+ 
+-static const struct nvkm_volt_func
+-gf117_volt = {
++static const struct nvkm_volt_func gf117_volt_gpio = {
+ 	.oneinit = gf100_volt_oneinit,
+ 	.vid_get = nvkm_voltgpio_get,
+ 	.vid_set = nvkm_voltgpio_set,
++	.speedo_read = gf117_volt_speedo_read,
++}, gf117_volt_pwm = {
++	.oneinit = gf100_volt_oneinit,
++	.volt_get = gf117_volt_pwm_get,
+ 	.speedo_read = gf117_volt_speedo_read,
+ };
+ 
+@@ -49,13 +78,41 @@
+ gf117_volt_new(struct nvkm_device *device, enum nvkm_subdev_type type, int inst,
+ 	       struct nvkm_volt **pvolt)
+ {
+-	struct nvkm_volt *volt;
+-	int ret;
++	const struct nvkm_volt_func *func = &gf117_volt_gpio;
++	struct gf117_volt *volt;
++	struct nvbios_volt bios;
++	struct dcb_gpio_func gpio;
++	u8 ver, hdr, cnt, len;
++	bool pwm = false;
++	int ret = 0;
++	*pvolt = NULL;
+ 
+-	ret = nvkm_volt_new_(&gf117_volt, device, type, inst, &volt);
+-	*pvolt = volt;
+-	if (ret)
+-		return ret;
++	if (device->bios &&
++	    nvbios_volt_parse(device->bios, &ver, &hdr, &cnt, &len, &bios) &&
++	    bios.type == NVBIOS_VOLT_PWM) {
++		if (bios.base && bios.pwm_range && bios.pwm_freq &&
++		    bios.base <= INT_MAX && bios.pwm_range <= INT_MAX - bios.base &&
++		    device->gpio &&
++		    !nvkm_gpio_find(device->gpio, 0, DCB_GPIO_VID_PWM, 0xff, &gpio)) {
++			func = &gf117_volt_pwm;
++			pwm = true;
++		} else {
++			/* The BIOS asks for PWM; GPIO VID would report a false voltage. */
++			return 0;
++		}
++	}
+ 
+-	return nvkm_voltgpio_init(volt);
++	volt = kzalloc_obj(*volt);
++	if (!volt)
++		return -ENOMEM;
++	nvkm_volt_ctor(func, device, type, inst, &volt->base);
++	*pvolt = &volt->base;
++	if (pwm) {
++		volt->bios = bios;
++		nvkm_info(&volt->base.subdev, "GF117 VBIOS PWM voltage readback enabled (read-only)\n");
++	} else {
++		ret = nvkm_voltgpio_init(&volt->base);
++	}
++
++	return ret;
+ }
+--- a/drivers/gpu/drm/nouveau/include/nvkm/core/device.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/core/device.h
+@@ -125,9 +125,27 @@
+ #define nvkm_rd08(d,a) ioread8((d)->pri + (a))
+ #define nvkm_rd16(d,a) ioread16_native((d)->pri + (a))
+ #define nvkm_rd32(d,a) ioread32_native((d)->pri + (a))
+-#define nvkm_wr08(d,a,v) iowrite8((v), (d)->pri + (a))
++static inline void nvkm_wr08(struct nvkm_device *device, u32 addr, u8 value)
++{
++	/* GF117 Optimus has no legacy display CRTC. Catch callers which bypass
++	 * the VGA and VBIOS helpers, so they cannot fault on its absent block. */
++	if (unlikely(device->chipset == 0xd7 && (addr & ~3U) == 0x6013d4)) {
++		pr_warn_once("nouveau GF117: blocked legacy CRTC MMIO write; caller %pS\n",
++			     __builtin_return_address(0));
++		return;
++	}
++	iowrite8(value, device->pri + addr);
++}
+ #define nvkm_wr16(d,a,v) iowrite16_native((v), (d)->pri + (a))
+-#define nvkm_wr32(d,a,v) iowrite32_native((v), (d)->pri + (a))
++static inline void nvkm_wr32(struct nvkm_device *device, u32 addr, u32 value)
++{
++	if (unlikely(device->chipset == 0xd7 && (addr & ~3U) == 0x6013d4)) {
++		pr_warn_once("nouveau GF117: blocked legacy CRTC MMIO write; caller %pS\n",
++			     __builtin_return_address(0));
++		return;
++	}
++	iowrite32_native(value, device->pri + addr);
++}
+ #define nvkm_mask(d,a,m,v) ({                                                  \
+ 	struct nvkm_device *_device = (d);                                     \
+ 	u32 _addr = (a), _temp = nvkm_rd32(_device, _addr);                    \
