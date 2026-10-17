@@ -4,6 +4,12 @@ from pathlib import Path
 import subprocess
 import tempfile
 s=Path(__file__).with_name('test-gf117-core-once.sh').read_text()
+probe_start=s.index('if (( probe_only )); then', s.index('plan=$(cat "$debugfs/pstate_plan")'))
+clock_request=s.index('clock_attempted=1', probe_start)
+probe_branch=s[probe_start:clock_request]
+assert 'gf117_pwm_diag' in probe_branch
+assert 'Sonda concluída: nenhum pedido de clock foi escrito.' in probe_branch
+assert "printf '0f\\n'" not in probe_branch
 def function(name):
     a=s.index(name+'() {');b=s.index('\n}',a)+2
     return s[a:b]+'\n'

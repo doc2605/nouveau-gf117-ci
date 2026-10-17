@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 # Teste físico explícito GF117: carga temporária, sem instalar módulo.
 set -euo pipefail
+probe_only=0
 case "${1:-}" in
     --help|-h|'')
-        echo "Uso: sudo $0 --apply"
-        echo "Troca temporariamente o Nouveau e tenta 0f no núcleo, com RAM preservada."
-        echo "Execute em TTY com a GPU desocupada. Uma falha pode exigir reinicialização."
+        echo "Uso: sudo $0 --probe-only"
+        echo "Lê GPIO/PWM candidato, sem solicitar mudança de clock."
+        echo "Para o teste de clock: sudo $0 --apply (exige GPU ociosa e TTY)."
         exit 0 ;;
+    --probe-only) [[ $# == 1 ]] || exit 2; probe_only=1 ;;
     --apply) [[ $# == 1 ]] || exit 2 ;;
     *) echo "Argumento inválido; use --help" >&2; exit 2 ;;
 esac
 [[ $EUID == 0 ]] || { echo "Execute com sudo." >&2; exit 2; }
-module=/home/doc/Nvidia-GT720M-Fix-atualizado/artifacts/github-actions/38996866874/gf117-nouveau-f5117af2d3184cfc6f3dc601fcccd2e69570cc26/nouveau.ko
-expected_hash=2bb10c11896ba5e7a7ae5da4d557920fdd4dfb28a9ea50ec0e5a6024995ed56c
+module=/home/doc/Nvidia-GT720M-Fix-atualizado/artifacts/github-actions/39002141912/gf117-nouveau-7d85a2d10ebf903fa0c8cc08c835e796ee508dcd/nouveau.ko
+expected_hash=a6486b2bfd84958ffa7e83b19192b5078872b4068c540a2fd8d68e9d47455344
 device=/sys/bus/pci/devices/0000:08:00.0
 debugfs=/sys/kernel/debug/dri/0000:08:00.0
 hwmon_root=/sys/class/hwmon
@@ -26,7 +28,11 @@ touch "$log_file"; chown "$home_owner" "$log_file"; chmod 0644 "$log_file"
 exec > >(tee -a "$log_file") 2>&1
 echo "log: $log_file"
 echo "started: $(date --iso-8601=seconds)"
-echo "TESTE FÍSICO: núcleo VBIOS 0f, RAM preservada, noaccel=1, runpm=0"
+if (( probe_only )); then
+    echo "SONDA FÍSICA SOMENTE LEITURA: sem solicitação de p-state/clock"
+else
+    echo "TESTE FÍSICO: núcleo VBIOS 0f, RAM preservada, noaccel=1, runpm=0"
+fi
 stock_removed=0
 custom_loaded=0
 clock_attempted=0
@@ -320,6 +326,14 @@ custom_loaded=1
 cat "$debugfs/pstate"
 plan=$(cat "$debugfs/pstate_plan")
 printf '%s\n' "$plan"
+if (( probe_only )); then
+    [[ "$plan" == *gf117_pwm_diag* ]] || {
+        echo "Linha de diagnóstico PWM GF117 ausente." >&2; exit 1;
+    }
+    check_faults "$load_cursor"
+    echo "Sonda concluída: nenhum pedido de clock foi escrito."
+    exit 0
+fi
 [[ "$plan" == allow_reclock=1* ]] || { echo "Opt-in não foi reconhecido." >&2; exit 1; }
 [[ "$plan" == *'requested_core_khz=775000 '* ]] || {
     echo "O estado de 775 MHz esperado não foi encontrado." >&2; exit 1;
