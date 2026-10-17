@@ -204,8 +204,16 @@ bytes antes de consultar `max2`. Sem esse campo, o ID é `0xff`.
 ## 0016 `gf117-trace-pwm-and-blocked-crtc-accesses`
 
 A leitura PWM anterior falhou com `-ERANGE` sem mostrar os registradores brutos.
-Este patch registra divisor, duty e faixa calculada quando a leitura é rejeitada,
-sem habilitar escrita PWM. Também registra qual dos guards VGA/DRM/VBIOS de GF117
-foi acionado para o CRTC legado. As mensagens são instrumentação; não provam que
-o fault em `6013d4` foi eliminado. O próximo módulo deve ser compilado e revisado
-antes de qualquer nova carga física.
+Este patch registrava divisor e duty do getter PWM somente leitura e qual dos
+guards VGA/DRM/VBIOS de GF117 foi acionado para o CRTC legado. A leitura PWM foi
+desativada pelo patch 0017 após retornar `0/0` no hardware; a instrumentação do
+CRTC continua útil e não prova que o fault em `6013d4` foi eliminado.
+
+## 0017 `gf117-disable-unverified-pwm-readback`
+
+O teste físico mostrou `0x20340=0` e `0x20344=0` na GF117. Esse par veio do
+backend GK104 e não tem layout validado para GF117. O driver agora deixa o
+subdevice de tensão ausente quando a VBIOS pede PWM, evitando tratar esses dados
+como tensão ou cair para GPIO VID. O preflight de reclocking falha fechado; o
+clock permanece bloqueado até existir um backend PWM/VID comprovado. O fault
+`PRIVRING` em `0x6013d4` também permanece sem origem identificada.
