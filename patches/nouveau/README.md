@@ -217,3 +217,20 @@ subdevice de tensão ausente quando a VBIOS pede PWM, evitando tratar esses dado
 como tensão ou cair para GPIO VID. O preflight de reclocking falha fechado; o
 clock permanece bloqueado até existir um backend PWM/VID comprovado. O fault
 `PRIVRING` em `0x6013d4` também permanece sem origem identificada.
+
+
+## 0018 `gf117-readonly-gf119-pwm-probe`
+
+GF117 (`0xd7`) seleciona `gf119_therm_new()`. O caminho PWM térmico GF119
+consulta o mux do GPIO em `0xd610 + linha*4`, usa os canais `0xe114/0xe118`
+e `0xe11c/0xe120`, e também reconhece um canal PTHERM em `0x200d8/0x200dc`.
+O teste anterior leu `0x20340/0x20344`, usados pelo backend de tensão GK104; os
+zeros observados ali não descartam o caminho PWM GF119.
+
+O patch 0018 expõe somente leituras desses registradores para a linha 11 no
+`pstate_plan`; não grava MMIO, não converte duty em tensão e não habilita
+reclock. O mapeamento do PWM térmico é uma pista candidata para a saída
+`VID_PWM` da VBIOS, ainda precisa de confirmação física por telemetria.
+
+O teste `tools/test-gf117-pwm-probe.py` verifica os endereços e a ausência de
+qualquer accessor de escrita no bloco diagnóstico.

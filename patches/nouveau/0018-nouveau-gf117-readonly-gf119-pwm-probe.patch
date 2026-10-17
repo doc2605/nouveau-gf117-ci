@@ -1,0 +1,43 @@
+From: Codex <codex@openai.com>
+Subject: [PATCH] nouveau: add read-only GF117/GF119 PWM register probe
+
+GF117 selects gf119_therm_new(), whose PWM routing is distinct from the GK104
+voltage controller at 0x20340/0x20344. Expose the GPIO11 mux and the candidate
+GF119 PWM/PTHERM registers through the existing read-only pstate_plan debugfs
+file. This does not calculate or claim a measured voltage and performs no MMIO
+writes.
+
+--- a/drivers/gpu/drm/nouveau/nouveau_debugfs.c
++++ b/drivers/gpu/drm/nouveau/nouveau_debugfs.c
+@@ -233,6 +233,31 @@
+ 			seq_printf(m, "state=%d voltage_limit_uv=%d vid_mask=%u vid_count=%u\n",
+ 				   state, limit_uv, volt ? volt->vid_mask : 0,
+ 				   volt ? volt->vid_nr : 0);
++			/* GF117 uses gf119_therm_new(). Expose the documented GF119 PWM
++			 * channel candidates read-only; the GK104 voltage pair is unrelated. */
++			{
++				u32 gpio11 = nvif_rd32(&ndrm->client.device.object, 0x00d63c);
++				u32 div0 = nvif_rd32(&ndrm->client.device.object, 0x00e114);
++				u32 duty0 = nvif_rd32(&ndrm->client.device.object, 0x00e118);
++				u32 div1 = nvif_rd32(&ndrm->client.device.object, 0x00e11c);
++				u32 duty1 = nvif_rd32(&ndrm->client.device.object, 0x00e120);
++				u32 thdiv = nvif_rd32(&ndrm->client.device.object, 0x0200d8);
++				u32 thduty = nvif_rd32(&ndrm->client.device.object, 0x0200dc);
++				int pwm_index = -1;
++
++				if ((gpio11 & 0x000000c0) == 0x00000000 ||
++				    (gpio11 & 0x000000c0) == 0x00000040) {
++					switch (gpio11 & 0x0000001f) {
++					case 0x00: case 0x1e: pwm_index = 2; break;
++					case 0x19: pwm_index = 1; break;
++					case 0x1c: pwm_index = 0; break;
++					default: break;
++					}
++				}
++				seq_printf(m, "gf117_pwm_diag gpio_line11=%08x pwm_index=%d "
++					   "pwm0=%08x/%08x pwm1=%08x/%08x therm=%08x/%08x\n",
++					   gpio11, pwm_index, div0, duty0, div1, duty1, thdiv, thduty);
++			}
+ 		}
+ 
+ 		if (ram_ret)
